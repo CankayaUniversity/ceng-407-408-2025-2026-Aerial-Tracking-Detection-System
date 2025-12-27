@@ -98,6 +98,38 @@ def organize_dataset(input_base_dir="dataset", output_base_dir="dataset_rgb"):
 
 
 
+def apply_highlight_test(frame, pred_bbox, alpha=0.5, expand_ratio=3.0):
+    """Görüntüyü takip edilen drone'un tahmin edilen konumuna göre karartır/parlatır."""
+    h, w, _ = frame.shape
+    highlighted = (frame * alpha).astype(np.uint8)
+
+    if pred_bbox is None:
+        return frame  # Takip yoksa orijinal görüntüyü döndür
+
+    px, py, pw, ph = pred_bbox
+    # Tahmini kutuyu genişlet (Modelin etrafı görmesi için)
+    nx1 = int(max(0, px - (pw * (expand_ratio - 1) / 2)))
+    ny1 = int(max(0, py - (ph * (expand_ratio - 1) / 2)))
+    nx2 = int(min(w, px + pw + (pw * (expand_ratio - 1) / 2)))
+    ny2 = int(min(h, py + ph + (ph * (expand_ratio - 1) / 2)))
+
+    highlighted[ny1:ny2, nx1:nx2] = frame[ny1:ny2, nx1:nx2]
+    return highlighted
+
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    union = boxA[2] * boxA[3] + boxB[2] * boxB[3] - interArea
+    return interArea / union if union > 0 else 0.0
+
+def model_layer_debug(yolo_model):
+    #see model layers
+    for i, layer in enumerate(yolo_model.model.model):
+        print(i, layer)
 
 # ======================================================
 # FRAME NAME PARSER

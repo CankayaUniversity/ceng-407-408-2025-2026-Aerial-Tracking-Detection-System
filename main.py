@@ -57,7 +57,7 @@ def test_metrics(
             # ---------------- VIDEO CHANGED ----------------
             if prev_video is not None and video_key != prev_video:
                 res = finalize_metrics(stats, state_history)
-                print(f"\n📹 Video: {prev_video}")
+                print(f"\nVideo: {prev_video}")
                 for k, v in res.items():
                     print(f"{k}: {v:.4f}")
 
@@ -154,7 +154,7 @@ def test_metrics(
         # ---------------- LAST VIDEO ----------------
         if prev_video is not None:
             res = finalize_metrics(stats, state_history)
-            print(f"\n📹 Video: {prev_video}")
+            print(f"\nVideo: {prev_video}")
             for k, v in res.items():
                 print(f"{k}: {v:.4f}")
             global_results.append(res)
@@ -220,13 +220,13 @@ def get_roi(
     y2 = max(1, min(y2, orig_h))
 
     # -----------------------------
-    # 2️⃣ ROI output size
+    # ROI output size
     # -----------------------------
     roi_w = min(max_size, max(1, int(max_size * (x2 - x1) / orig_w)))
     roi_h = min(max_size, max(1, int(max_size * (y2 - y1) / orig_h)))
 
     # -----------------------------
-    # 3️⃣ ROI Align
+    # ROI Align
     # -----------------------------
     _, _, Hf, Wf = feature_map.shape
     spatial_scale = min(Wf / orig_w, Hf / orig_h)

@@ -25,20 +25,14 @@ A multi-channel ground control station (GCS) application for tracking objects ac
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/username/aiui.git
-   cd aiui
+   git clone https://github.com/CankayaUniversity/ceng-407-408-2025-2026-Aerial-Tracking-Detection-System.git
+   cd ceng-407-408-2025-2026-Aerial-Tracking-Detection-System
    ```
 
 2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-
-3. Add your YOLO model weights (`.pt` files) to the `models/` directory:
-   - `models/rgb_normal.pt`
-   - `models/rgb_highlight.pt`
-   - `models/ir_normal.pt`
-   - `models/ir_highlight.pt`
 
 ## Usage
 

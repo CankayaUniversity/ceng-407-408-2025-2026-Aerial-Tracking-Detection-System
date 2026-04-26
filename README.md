@@ -5,4 +5,7 @@ Aerial Tracking &amp; Detection System
 
 [Dataset Description & Preprocessing](https://github.com/CankayaUniversity/ceng-407-408-2025-2026-Aerial-Tracking-Detection-System/wiki/Dataset-Description-%26-Preprocessing)
 
-[Methodology](https://github.com/CankayaUniversity/ceng-407-408-2025-2026-Aerial-Tracking-Detection-System/wiki/Methodology)
+[Methodology CENG407](https://github.com/CankayaUniversity/ceng-407-408-2025-2026-Aerial-Tracking-Detection-System/wiki/CENG407-Methodology)
+
+[Methodology CENG408](https://github.com/CankayaUniversity/ceng-407-408-2025-2026-Aerial-Tracking-Detection-System/wiki/CENG408-Methodology)
+

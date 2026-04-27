@@ -17,12 +17,14 @@ def iou(boxA, boxB):
 
 
 def prediction_function(track, max_history=5):
-    """ Weighted Regression: Son 5 konuma bakarak t+1 tahmini yapar """
+    """ Weighted Regression: Son N konuma bakarak t+1 tahmini yapar """
     if len(track.history) < 2:
         return track.bbox
 
     N = min(max_history, len(track.history))
     xs, ys, ws, hs = [], [], [], []
+
+    # Yakın geçmişe daha fazla ağırlık veren lineer dağılım
     weights = np.linspace(1, N, N)
     weights = weights / weights.sum()
 
@@ -128,7 +130,22 @@ class Tracker:
             if current_cost < (1.0 - self.iou_threshold):
                 track = self.tracks[t_idx]
                 det = detections[d_idx]
-                
+
+                if len(track.history) >= 3:
+                    pred_bbox = prediction_function(track)
+                    pred_cx = pred_bbox[0] + pred_bbox[2] / 2
+                    pred_cy = pred_bbox[1] + pred_bbox[3] / 2
+                    det_cx = det[0] + det[2] / 2
+                    det_cy = det[1] + det[3] / 2
+
+                    error_dist = np.sqrt((pred_cx - det_cx) ** 2 + (pred_cy - det_cy) ** 2)
+
+                    # Eğer hata 25 pikselden büyükse, drone ani manevra yapmıştır.
+                    if error_dist > 25.0:
+                        # Geçmişi silip sadece son konumu bırakıyoruz.
+                        # Böylece atalet sıfırlanıyor ve yeni rotaya milimetrik uyum sağlanıyor.
+                        track.history = track.history[-1:]
+
                 # Arka Plan Hareketi (Camera Panning) Kontrolü
                 if len(track.history) > 0:
                     old_det = track.history[-1]

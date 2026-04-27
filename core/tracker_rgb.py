@@ -29,54 +29,39 @@ def safe_cosine(a, b):
 
     return cosine(a, b)
 
-def prediction_function(track, max_history=4):
-    """
-    track.history: [(x, y, w, h), ...]
-    track.bbox: [x, y, w, h]
-    """
-
-    if len(track.history) == 0:
+def prediction_function(track, max_history=5):
+    """ Weighted Regression: Son N konuma bakarak t+1 tahmini yapar """
+    if len(track.history) < 2:
         return track.bbox
 
-    if len(track.history) == 1:
-        return track.history[-1]
-
     N = min(max_history, len(track.history))
-
     xs, ys, ws, hs = [], [], [], []
 
+    # Yakın geçmişe daha fazla ağırlık veren lineer dağılım
     weights = np.linspace(1, N, N)
     weights = weights / weights.sum()
 
     for i in range(-N, 0):
         x, y, w, h = track.history[i]
-        xs.append(x)
-        ys.append(y)
-        ws.append(w)
+        xs.append(x);
+        ys.append(y);
+        ws.append(w);
         hs.append(h)
-
-    xs = np.array(xs)
-    ys = np.array(ys)
-
-    def weighted_linreg(t, values, weights):
-        X = np.vstack([t, np.ones_like(t)]).T
-        W = np.diag(weights)
-        theta = np.linalg.pinv(X.T @ W @ X) @ (X.T @ W @ values)
-        return theta  # [a, b]
 
     t = np.arange(N)
 
-    a_x, b_x = weighted_linreg(t, xs, weights)
-    a_y, b_y = weighted_linreg(t, ys, weights)
+    def weighted_linreg(t, values, w_vec):
+        X = np.vstack([t, np.ones_like(t)]).T
+        W = np.diag(w_vec)
+        theta = np.linalg.pinv(X.T @ W @ X) @ (X.T @ W @ values)
+        return theta  # [eğim, kayma]
 
-    t_next = N
-    pred_x = a_x * t_next + b_x
-    pred_y = a_y * t_next + b_y
+    a_x, b_x = weighted_linreg(t, np.array(xs), weights)
+    a_y, b_y = weighted_linreg(t, np.array(ys), weights)
 
-    w = ws[-1]
-    h = hs[-1]
-
-    return [pred_x, pred_y, w, h]
+    pred_x = a_x * N + b_x
+    pred_y = a_y * N + b_y
+    return [pred_x, pred_y, ws[-1], hs[-1]]
 
 
 
@@ -254,6 +239,20 @@ class Tracker:
 
                 track = self.tracks[t_idx]
                 det = detections[d_idx]
+
+                if len(track.history) >= 3:
+                    pred_bbox = prediction_function(track)
+                    pred_cx = pred_bbox[0] + pred_bbox[2] / 2
+                    pred_cy = pred_bbox[1] + pred_bbox[3] / 2
+                    det_cx = det[0] + det[2] / 2
+                    det_cy = det[1] + det[3] / 2
+
+                    error_dist = np.sqrt((pred_cx - det_cx) ** 2 + (pred_cy - det_cy) ** 2)
+
+                    # Eğer hata 25 pikselden büyükse, drone ani manevra yapmıştır.
+                    if error_dist > 25.0:
+                        # Geçmişi silip sadece son konumu bırakıyoruz.
+                        track.history = track.history[-1:]
 
                 # Arka Plan Hareketi (Camera Panning) Kontrolü
                 if len(track.history) > 0:

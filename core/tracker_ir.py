@@ -50,15 +50,19 @@ def prediction_function(track, max_history=5):
 
 
 class Track:
-    def __init__(self, track_id, bbox, last_seen_frame):
+    def __init__(self, track_id, bbox, last_seen_frame, fps=30):
         self.track_id = track_id
         self.bbox = bbox
         self.last_seen_frame = last_seen_frame
         self.missing_frames = 0
         self.history = []
         self.sim = 0
-    def is_stationary(self, frame_window=30, pixel_threshold=5.0):
+        self.fps = fps
+    def is_stationary(self, frame_window=None, pixel_threshold=5.0):
         """Son 'frame_window' kadar karede kutu merkezinin ne kadar hareket ettiğine bakar."""
+        if frame_window is None:
+            frame_window = int(2 * self.fps)
+            
         if len(self.history) < frame_window:
             return False  # Henüz yeterince geçmiş yoksa hareketli varsay
         
@@ -78,11 +82,12 @@ class Track:
         return dist < pixel_threshold
 
 class Tracker:
-    def __init__(self, iou_threshold=0.1, max_missing=10):
+    def __init__(self, iou_threshold=0.1, max_missing=10, fps=30):
         self.tracks = []
         self.next_id = 0
         self.iou_threshold = iou_threshold
         self.max_missing = max_missing
+        self.fps = fps
 
     def update(self, detections, frame_idx, frame_width=640, frame_height=512, bg_dx=0.0, bg_dy=0.0):
         assigned_tracks = set()
@@ -90,7 +95,7 @@ class Tracker:
 
         if len(self.tracks) == 0:
             for det in detections:
-                t = Track(self.next_id, det, frame_idx)
+                t = Track(self.next_id, det, frame_idx, fps=self.fps)
                 t.history.append(det)
                 self.tracks.append(t)
                 self.next_id += 1
@@ -172,7 +177,7 @@ class Tracker:
         # Yeni Çıkan Drone'ları Ekle
         for d_idx, det in enumerate(detections):
             if d_idx not in assigned_detections:
-                t = Track(self.next_id, det, frame_idx)
+                t = Track(self.next_id, det, frame_idx, fps=self.fps)
                 t.history.append(det)
                 self.tracks.append(t)
                 self.next_id += 1
@@ -214,7 +219,8 @@ class Tracker:
         max_score = -1.0
 
         for t in active_tracks:
-            history_score = min(len(t.history), 50) / 50.0
+            history_window = int(2 * self.fps)
+            history_score = min(len(t.history), history_window) / float(history_window)
 
             current_sim = t.sim
 

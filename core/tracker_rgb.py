@@ -89,8 +89,7 @@ def update_embedding(old_emb, new_emb, momentum=0.9):
     return emb
 
 class Track:
-
-    def __init__(self, track_id, bbox, embedding, last_seen_frame):
+    def __init__(self, track_id, bbox, embedding, last_seen_frame, fps=30):
         self.track_id = track_id
         self.bbox = bbox
         self.embedding = embedding
@@ -98,8 +97,12 @@ class Track:
         self.missing_frames = 0
         self.history = []
         self.sim = 0
-    def is_stationary(self, frame_window=15, pixel_threshold=5.0):
+        self.fps = fps
+    def is_stationary(self, frame_window=None, pixel_threshold=5.0):
         """Son 'frame_window' kadar karede kutu merkezinin ne kadar hareket ettiğine bakar."""
+        if frame_window is None:
+            frame_window = int(2 * self.fps)
+            
         if len(self.history) < frame_window:
             return False  # Henüz yeterince geçmiş yoksa hareketli varsay
         
@@ -122,11 +125,12 @@ class Tracker:
     """
     Tracker class will be used for ID assignment
     """
-    def __init__(self, similarity_threshold=0.7, max_missing=10):
+    def __init__(self, similarity_threshold=0.7, max_missing=10, fps=30):
         self.tracks = []
         self.next_id = 0
         self.similarity_threshold = similarity_threshold
         self.max_missing = max_missing
+        self.fps = fps
 
     def remove_duplicate_tracks(self):
         """
@@ -166,7 +170,7 @@ class Tracker:
             for d_idx, det in enumerate(detections):
                 emb = embeddings[d_idx]
 
-                t = Track(self.next_id, det, emb, frame_idx)
+                t = Track(self.next_id, det, emb, frame_idx, fps=self.fps)
                 t.history.append(det)
                 self.tracks.append(t)
                 self.next_id += 1
@@ -314,7 +318,7 @@ class Tracker:
                 if emb is not None and np.linalg.norm(emb) < 1e-6:
                     emb = None
 
-                t = Track(self.next_id, det, emb, frame_idx)
+                t = Track(self.next_id, det, emb, frame_idx, fps=self.fps)
                 t.history.append(det)
                 self.tracks.append(t)
                 self.next_id += 1
@@ -347,7 +351,8 @@ class Tracker:
         max_score = -1.0
 
         for t in active_tracks:
-            history_score = min(len(t.history), 50) / 50.0
+            history_window = int(2 * self.fps)
+            history_score = min(len(t.history), history_window) / float(history_window)
 
             current_sim = t.sim
 

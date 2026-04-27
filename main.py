@@ -6,6 +6,16 @@ import torch
 import numpy as np
 from datetime import datetime
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QFrame, QGridLayout, QSizePolicy, QComboBox, QSlider,
@@ -113,11 +123,11 @@ class VideoThread(QThread):
         # Load models
         try:
             if self.mode == "RGB":
-                without_model_path = os.path.join("models", "rgb_normal.pt")
-                motion_model_path = os.path.join("models", "rgb_highlight.pt")
+                without_model_path = resource_path(os.path.join("models", "rgb_normal.pt"))
+                motion_model_path = resource_path(os.path.join("models", "rgb_highlight.pt"))
             else:
-                without_model_path = os.path.join("models", "ir_normal.pt")
-                motion_model_path = os.path.join("models", "ir_highlight.pt")
+                without_model_path = resource_path(os.path.join("models", "ir_normal.pt"))
+                motion_model_path = resource_path(os.path.join("models", "ir_highlight.pt"))
             
             without_model = YOLO(without_model_path)
             motion_model = YOLO(motion_model_path)
@@ -130,12 +140,6 @@ class VideoThread(QThread):
         if use_resnet and self.mode == "RGB":
             resnet_model, resnet_preprocess = load_resnet18_embedder(device)
             
-        if self.mode == "RGB":
-            tracker = RGBTracker(similarity_threshold=0.5, max_missing=10)
-            self.log_signal.emit("INFO", "RGB Tracker initialized")
-        else:
-            tracker = IRTracker(iou_threshold=0.1, max_missing=10)
-            self.log_signal.emit("INFO", "IR Tracker initialized")
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             print("Video açılamadı!")
@@ -144,6 +148,16 @@ class VideoThread(QThread):
         orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30.0 # Default if unknown
+            
+        if self.mode == "RGB":
+            tracker = RGBTracker(similarity_threshold=0.5, max_missing=10, fps=fps)
+            self.log_signal.emit("INFO", f"RGB Tracker initialized with {fps} FPS")
+        else:
+            tracker = IRTracker(iou_threshold=0.1, max_missing=10, fps=fps)
+            self.log_signal.emit("INFO", f"IR Tracker initialized with {fps} FPS")
+
         frame_idx = 0
         prev_time = time.time()
         
@@ -190,11 +204,17 @@ class VideoThread(QThread):
                 tracker.similarity_threshold = self.sim_thresh
                 scored_tracks = []
                 for t in tracker.tracks:
-                    history_score = min(len(t.history), 50) / 50.0
+                    history_score = min(len(t.history), int(2 * fps)) / (2 * fps)
                     total_score = (history_score * 0.5) + (t.sim * 0.5)
                     scored_tracks.append((total_score, t))
                 scored_tracks.sort(key=lambda x: x[0], reverse=True)
                 best_track = tracker.get_best_track() 
+                
+                # Stationary Check
+                if best_track is not None and best_track.is_stationary(frame_window=int(2 * fps)):
+                    self.log_signal.emit("KILL", f"Track #{best_track.track_id} killed: stationary. Tracker reset.")
+                    tracker.reset()
+                    best_track = None
                 
                 use_motion = best_track is not None and best_track.missing_frames == 0
                 current_model_name = "Motion Model" if use_motion else "Base Model"
@@ -231,7 +251,7 @@ class VideoThread(QThread):
                 scored_tracks = sorted(tracker.tracks, key=lambda t: t.missing_frames)
                 best_track = tracker.get_best_track()
                 
-                if best_track is not None and best_track.is_stationary():
+                if best_track is not None and best_track.is_stationary(frame_window=int(2 * fps)):
                     self.log_signal.emit("KILL", f"Track #{best_track.track_id} killed: stationary. Tracker reset.")
                     tracker.reset()
                     best_track = None
@@ -275,7 +295,7 @@ class VideoThread(QThread):
                 sim_val = getattr(t, 'sim', 0.0)
                 draw_hud_bbox(frame, x, y, w, h, t.track_id, sim=sim_val)
                 
-                score = min(len(t.history), 50) / 50.0 * 0.5 + sim_val * 0.5
+                score = min(len(t.history), int(2 * fps)) / (2 * fps) * 0.5 + sim_val * 0.5
                 if score > best_active_score:
                     best_active_score = score
                     best_active = t

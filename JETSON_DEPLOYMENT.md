@@ -100,25 +100,32 @@ cd /home/jetson/jetson_edge
 2. Click the **"+ Add Edge Channel"** button.
 3. Click **"Listen for Connection"** to wait for the Jetson.
 
-### Step 5.2: Launch on Jetson
-Run the edge script inside the Jetson container. The script will automatically look for the `*.engine` files you generated.
+### Jetson Edge Node Parameters
 
-**Standard Run (RGB Mode with video file):**
+The Edge Node has two types of parameters: Local CLI arguments and Remote Config parameters.
+
+**Local CLI Arguments (Passed when starting the script):**
+- `--video`: Path to a video file (e.g., `5.mp4`) or camera index (`0` for `/dev/video0`). Default: `0`.
+- `--skip-frames`: Skips N frames between AI detections to save computation (relies on optical flow for the gaps). Example: `--skip-frames 1` doubles FPS. Default: `0`.
+
+**Remote Config Parameters (Controlled via Main Hub UI):**
+*You do NOT pass these in the terminal. The Jetson receives them automatically once connected to the Main PC.*
+- `Mode (RGB / IR)`: Switches between the RGB and IR `.engine` models on the fly.
+- `Target FPS`: Syncs processing speed.
+- `Confidence & IoU Thresholds`: Adjusts detection strictness.
+- `No Video Mode`: Stops sending frames back to the PC (telemetry only) to save Wi-Fi bandwidth.
+
+#### Example Run Commands:
+
+**Standard Camera Run (Uses `/dev/video0`):**
 ```bash
 cd /home/jetson/jetson_edge
-python3 jetson_edge_node.py --video 5.mp4
+python3 jetson_edge_node.py --video 0
 ```
 
-**Optimize with Frame Skipping (`--skip-frames`):**
-To drastically improve FPS, you can force the AI model to skip frames, relying on the optical flow tracker for the gaps:
+**Video File Run with Frame Skipping (High FPS):**
 ```bash
 python3 jetson_edge_node.py --video 5.mp4 --skip-frames 1
-```
-*(Using `--skip-frames 1` means it detects 1 frame, tracks 1 frame, detects 1 frame... effectively doubling the FPS.)*
-
-**Infrared (IR) Mode:**
-```bash
-python3 jetson_edge_node.py --video 0 --mode IR
 ```
 
 As soon as the script starts, it will output `[*] Listening for Main Hub broadcast on UDP port 50050...` and connect automatically within a few seconds (`[+] Connected to Main Hub.`).

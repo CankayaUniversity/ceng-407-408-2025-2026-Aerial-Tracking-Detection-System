@@ -79,6 +79,7 @@ def config_listener(sock):
 def main():
     parser = argparse.ArgumentParser(description="Jetson Edge Node (Pure TensorRT) for Aerial Tracking")
     parser.add_argument("--video", type=str, default="0", help="Path to video file or camera index (default: 0)")
+    parser.add_argument("--skip-frames", type=int, default=0, help="Skip N frames between detections to save computation (default: 0)")
     args = parser.parse_args()
 
     # Auto-discover main server
@@ -127,6 +128,7 @@ def main():
             conf_thresh = float(current_config.get("conf_thresh", 0.3))
             iou_thresh = float(current_config.get("iou_thresh", 0.45))
             no_video = current_config.get("no_video", False)
+            skip_frames = int(current_config.get("skip_frames", args.skip_frames))
 
             # Engine Paths
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -187,30 +189,6 @@ def main():
                 # Process Frame
                 t0 = time.time()
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                bg_dx, bg_dy = 0.0, 0.0
-                
-                if prev_gray is not None:
-                    if prev_pts is None or len(prev_pts) < 10:
-                        prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
-                    if prev_pts is not None and len(prev_pts) > 0:
-                        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None)
-                        if curr_pts is not None and status is not None:
-                            status = status.flatten()
-                            good_new = curr_pts[status == 1]
-                            good_old = prev_pts[status == 1]
-                            if len(good_new) > 0:
-                                good_new_flat = good_new.reshape(-1, 2)
-                                good_old_flat = good_old.reshape(-1, 2)
-                                diffs = good_new_flat - good_old_flat
-                                bg_dx = np.median(diffs[:, 0])
-                                bg_dy = np.median(diffs[:, 1])
-                                prev_pts = good_new.reshape(-1, 1, 2)
-                            else:
-                                prev_pts = None
-                prev_gray = gray
-                t_flow = time.time() - t0
-                
-                t0 = time.time()
                 # Downscale for optical flow to reduce CPU cost
                 gray_small = cv2.resize(gray, (orig_w // 2, orig_h // 2))
                 bg_dx, bg_dy = 0.0, 0.0
@@ -236,6 +214,10 @@ def main():
                                 prev_pts = None
                 prev_gray = gray_small
                 t_flow = time.time() - t0
+                
+                t0 = time.time()
+                run_detect = (skip_frames == 0) or (frame_idx % (skip_frames + 1) == 0)
+                if mode.upper() == "RGB":
                     best_track = tracker.get_best_track() 
                     if best_track is not None and best_track.is_stationary(frame_window=int(2 * target_fps)):
                         tracker.reset()
@@ -243,15 +225,19 @@ def main():
                     
                     use_motion = best_track is not None and best_track.missing_frames == 0
                     current_model_name = "Motion Model" if use_motion else "Base Model"
-                    if use_motion:
-                        pred_bboxes = rgb_prediction_function(best_track)
-                        input_frame = apply_highlight_rgb(frame, pred_bboxes)
-                        model = motion_model
-                    else:
-                        input_frame = frame
-                        model = without_model
                     
-                    detections = model.predict(input_frame)
+                    if run_detect:
+                        if use_motion:
+                            pred_bboxes = rgb_prediction_function(best_track)
+                            input_frame = apply_highlight_rgb(frame, pred_bboxes)
+                            model = motion_model
+                        else:
+                            input_frame = frame
+                            model = without_model
+                        detections = model.predict(input_frame)
+                    else:
+                        detections = []  # tracker predicts on its own
+                        
                     t_detect = time.time() - t0
                     t0 = time.time()
                     embeddings = [None] * len(detections)
@@ -266,15 +252,19 @@ def main():
                     use_motion = best_track is not None and best_track.missing_frames == 0
                     current_model_name = "Motion Model" if use_motion else "Base Model"
                     
-                    if use_motion:
-                        pred_bboxes = ir_prediction_function(best_track)
-                        input_frame = apply_highlight_ir(frame, pred_bboxes)
-                        model = motion_model
-                    else:
-                        input_frame = frame
-                        model = without_model
+                    if run_detect:
+                        if use_motion:
+                            pred_bboxes = ir_prediction_function(best_track)
+                            input_frame = apply_highlight_ir(frame, pred_bboxes)
+                            model = motion_model
+                        else:
+                            input_frame = frame
+                            model = without_model
 
-                    detections = model.predict(input_frame)
+                        detections = model.predict(input_frame)
+                    else:
+                        detections = []
+                        
                     t_detect = time.time() - t0
                     t0 = time.time()
                     tracker.update(detections, frame_idx, frame_width=orig_w, frame_height=orig_h, bg_dx=bg_dx, bg_dy=bg_dy)

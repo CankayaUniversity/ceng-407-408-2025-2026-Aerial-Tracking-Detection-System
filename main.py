@@ -816,6 +816,7 @@ class EdgeNetworkThread(QThread):
         self.port = port
         self._run_flag = True
         self.server_socket = None
+        self.conn = None
 
     def run(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -832,21 +833,22 @@ class EdgeNetworkThread(QThread):
         self.status_signal.emit("Waiting for edge device...")
         self.log_signal.emit("INFO", f"Listening for edge connection on port {self.port}...")
         
-        conn = None
-        while self._run_flag and conn is None:
+        
+        self.conn = None
+        while self._run_flag and self.conn is None:
             try:
-                conn, addr = self.server_socket.accept()
+                self.conn, addr = self.server_socket.accept()
                 self.status_signal.emit(f"Connected: {addr[0]}")
                 self.log_signal.emit("INFO", f"Edge device connected from {addr[0]}")
             except socket.timeout:
                 continue
                 
         if not self._run_flag:
-            if conn: conn.close()
+            if self.conn: self.conn.close()
             self.server_socket.close()
             return
             
-        conn.settimeout(5.0)
+        self.conn.settimeout(5.0)
         data_buf = b""
         payload_size_struct = struct.calcsize("Q")
         
@@ -854,7 +856,7 @@ class EdgeNetworkThread(QThread):
             while self._run_flag:
                 # Read payload size
                 while len(data_buf) < payload_size_struct and self._run_flag:
-                    packet = conn.recv(4096)
+                    packet = self.conn.recv(4096)
                     if not packet: break
                     data_buf += packet
                 if not packet or len(data_buf) < payload_size_struct: break
@@ -865,7 +867,7 @@ class EdgeNetworkThread(QThread):
                 
                 # Read full payload
                 while len(data_buf) < payload_size and self._run_flag:
-                    packet = conn.recv(4096)
+                    packet = self.conn.recv(4096)
                     if not packet: break
                     data_buf += packet
                 if not packet or len(data_buf) < payload_size: break
@@ -899,7 +901,7 @@ class EdgeNetworkThread(QThread):
         except Exception as e:
             self.log_signal.emit("WARN", f"Connection error: {e}")
             
-        if conn: conn.close()
+        if getattr(self, 'conn', None): self.conn.close()
         if self.server_socket: self.server_socket.close()
         self.status_signal.emit("Disconnected.")
         self.log_signal.emit("INFO", "Edge connection closed.")
@@ -908,6 +910,22 @@ class EdgeNetworkThread(QThread):
     def stop(self):
         self._run_flag = False
         self.wait()
+
+    def send_config(self, config_dict):
+        if getattr(self, 'conn', None):
+            try:
+                json_bytes = json.dumps(config_dict).encode('utf-8')
+                json_size = len(json_bytes)
+                payload_size = 4 + json_size
+                header = struct.pack("Q", payload_size)
+                json_header = struct.pack("I", json_size)
+                
+                self.conn.sendall(header)
+                self.conn.sendall(json_header)
+                self.conn.sendall(json_bytes)
+                self.log_signal.emit("INFO", f"Sent remote config to edge.")
+            except Exception as e:
+                self.log_signal.emit("WARN", f"Failed to send config: {e}")
 
 class EdgeNetworkChannel(QFrame):
     closed_signal = pyqtSignal(object)
@@ -1003,7 +1021,45 @@ class EdgeNetworkChannel(QFrame):
         self.btn_listen.setStyleSheet(btn_style)
         self.btn_listen.clicked.connect(self.toggle_listen)
         
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["RGB", "IR"])
+        self.combo_mode.setStyleSheet("background-color: #333333; color: white;")
+        
+        self.spin_fps = QSpinBox()
+        self.spin_fps.setRange(1, 120)
+        self.spin_fps.setValue(30)
+        self.spin_fps.setStyleSheet("background-color: #333333; color: white;")
+        
+        self.spin_conf = QDoubleSpinBox()
+        self.spin_conf.setRange(0.01, 1.0)
+        self.spin_conf.setSingleStep(0.05)
+        self.spin_conf.setValue(0.3)
+        self.spin_conf.setStyleSheet("background-color: #333333; color: white;")
+        
+        self.spin_iou = QDoubleSpinBox()
+        self.spin_iou.setRange(0.01, 1.0)
+        self.spin_iou.setSingleStep(0.05)
+        self.spin_iou.setValue(0.45)
+        self.spin_iou.setStyleSheet("background-color: #333333; color: white;")
+        
+        self.chk_no_video = QCheckBox("No Video")
+        self.chk_no_video.setStyleSheet("color: white;")
+        
+        self.btn_apply_config = QPushButton("Apply Config")
+        self.btn_apply_config.setStyleSheet(btn_style.replace("#4a362e", "#2e3b4a").replace("#66483c", "#3c4a66"))
+        self.btn_apply_config.clicked.connect(self.apply_remote_config)
+        
         controls_layout.addWidget(self.btn_listen)
+        controls_layout.addWidget(QLabel("Mode:"))
+        controls_layout.addWidget(self.combo_mode)
+        controls_layout.addWidget(QLabel("FPS:"))
+        controls_layout.addWidget(self.spin_fps)
+        controls_layout.addWidget(QLabel("Conf:"))
+        controls_layout.addWidget(self.spin_conf)
+        controls_layout.addWidget(QLabel("IOU:"))
+        controls_layout.addWidget(self.spin_iou)
+        controls_layout.addWidget(self.chk_no_video)
+        controls_layout.addWidget(self.btn_apply_config)
         controls_layout.addStretch()
         left_layout.addLayout(controls_layout)
         
@@ -1018,6 +1074,20 @@ class EdgeNetworkChannel(QFrame):
         right_layout.addWidget(self.log_panel, stretch=1)
         
         main_layout.addLayout(right_layout, stretch=1)
+
+    def apply_remote_config(self):
+        if self.thread and getattr(self.thread, 'conn', None):
+            config = {
+                "type": "config",
+                "mode": self.combo_mode.currentText(),
+                "fps": self.spin_fps.value(),
+                "conf_thresh": self.spin_conf.value(),
+                "iou_thresh": self.spin_iou.value(),
+                "no_video": self.chk_no_video.isChecked()
+            }
+            self.thread.send_config(config)
+        else:
+            self.log_panel.append_log("WARN", "Edge device not connected yet.")
 
     def request_close(self):
         self.close_channel()

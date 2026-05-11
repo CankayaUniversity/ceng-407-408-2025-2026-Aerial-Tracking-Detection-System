@@ -37,13 +37,48 @@ def discover_server(udp_port=50050, timeout=30):
     finally:
         udp_socket.close()
 
+import threading
+
+current_config = None
+config_event = threading.Event()
+
+def config_listener(sock):
+    global current_config
+    payload_size_struct = struct.calcsize("Q")
+    data_buf = b""
+    while True:
+        try:
+            while len(data_buf) < payload_size_struct:
+                packet = sock.recv(4096)
+                if not packet: return
+                data_buf += packet
+            packed_size = data_buf[:payload_size_struct]
+            data_buf = data_buf[payload_size_struct:]
+            payload_size = struct.unpack("Q", packed_size)[0]
+            
+            while len(data_buf) < payload_size:
+                packet = sock.recv(4096)
+                if not packet: return
+                data_buf += packet
+                
+            payload = data_buf[:payload_size]
+            data_buf = data_buf[payload_size:]
+            
+            json_size = struct.unpack("I", payload[:4])[0]
+            json_bytes = payload[4:4+json_size]
+            config_dict = json.loads(json_bytes.decode('utf-8'))
+            
+            if config_dict.get("type") == "config":
+                current_config = config_dict
+                config_event.set()
+                print("[*] Received new remote config!")
+        except Exception as e:
+            print(f"[-] Config listener error: {e}")
+            break
+
 def main():
     parser = argparse.ArgumentParser(description="Jetson Edge Node (Pure TensorRT) for Aerial Tracking")
     parser.add_argument("--video", type=str, default="0", help="Path to video file or camera index (default: 0)")
-    parser.add_argument("--no-video", action="store_true", help="Send only telemetry, do not send video frames to save bandwidth/CPU")
-    parser.add_argument("--mode", type=str, default="RGB", choices=["RGB", "IR"], help="Processing mode: RGB or IR")
-    parser.add_argument("--base-model", type=str, default=None, help="Path to base TensorRT .engine model")
-    parser.add_argument("--motion-model", type=str, default=None, help="Path to motion TensorRT .engine model")
     args = parser.parse_args()
 
     # Auto-discover main server
@@ -62,18 +97,13 @@ def main():
         print(f"[-] Connection failed: {e}")
         sys.exit(1)
 
-    # Engine Paths
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    if args.mode.upper() == "RGB":
-        base_model_path = args.base_model or os.path.join(base_dir, "models", "rgb_normal.engine")
-        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "rgb_highlight.engine")
-    else:
-        base_model_path = args.base_model or os.path.join(base_dir, "models", "ir_normal.engine")
-        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "ir_highlight.engine")
-
-    print(f"[*] Loading TensorRT Engines...")
-    without_model = TRTYOLO(base_model_path)
-    motion_model = TRTYOLO(motion_model_path)
+    # Start Config Listener
+    listener_thread = threading.Thread(target=config_listener, args=(client_socket,), daemon=True)
+    listener_thread.start()
+    
+    print("[*] Waiting for remote configuration from Main Hub...")
+    config_event.wait()
+    config_event.clear()
 
     # Video Setup
     is_live = args.video.isdigit()
@@ -84,182 +114,215 @@ def main():
         print("[-] Failed to open video source.")
         sys.exit(1)
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0: fps = 30.0
-    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    if args.mode.upper() == "RGB":
-        tracker = RGBTracker(similarity_threshold=0.5, max_missing=10, fps=fps)
-    else:
-        tracker = IRTracker(iou_threshold=0.1, max_missing=10, fps=fps)
-    
-    start_real_time = time.time()
-    frame_idx = 0
-    prev_gray = None
-    prev_pts = None
-
-    print("[*] Starting detection loop...")
-    
     try:
-        while cap.isOpened():
-            loop_start = time.time()
-            
-            if not is_live:
-                elapsed_real_time = time.time() - start_real_time
-                target_frame = int(elapsed_real_time * fps)
-                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                
-                if current_frame < target_frame:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-            
-            ret, frame = cap.read()
-            if not ret:
-                print("[*] End of video stream.")
+        while True:
+            # Check if socket is still alive by checking if listener thread is alive
+            if not listener_thread.is_alive():
+                print("[-] Main Hub disconnected.")
                 break
 
-            # Process Frame
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            bg_dx, bg_dy = 0.0, 0.0
-            
-            if prev_gray is not None:
-                if prev_pts is None or len(prev_pts) < 10:
-                    prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
-                if prev_pts is not None and len(prev_pts) > 0:
-                    curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None)
-                    if curr_pts is not None and status is not None:
-                        status = status.flatten()
-                        good_new = curr_pts[status == 1]
-                        good_old = prev_pts[status == 1]
-                        if len(good_new) > 0:
-                            diffs = good_new - good_old
-                            bg_dx = np.median(diffs[:, 0])
-                            bg_dy = np.median(diffs[:, 1])
-                            prev_pts = good_new.reshape(-1, 1, 2)
-                        else:
-                            prev_pts = None
-            prev_gray = gray
-            
-            if args.mode.upper() == "RGB":
-                best_track = tracker.get_best_track() 
-                if best_track is not None and best_track.is_stationary(frame_window=int(2 * fps)):
-                    tracker.reset()
-                    best_track = None
-                
-                use_motion = best_track is not None and best_track.missing_frames == 0
-                current_model_name = "Motion Model" if use_motion else "Base Model"
-                if use_motion:
-                    pred_bboxes = rgb_prediction_function(best_track)
-                    input_frame = apply_highlight_rgb(frame, pred_bboxes)
-                    model = motion_model
-                else:
-                    input_frame = frame
-                    model = without_model
-                
-                # Inference via TensorRT
-                detections = model.predict(input_frame)
-                embeddings = [None] * len(detections) # No embeddings on edge
-                tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
+            global current_config
+            mode = current_config.get("mode", "RGB")
+            target_fps = float(current_config.get("fps", 30.0))
+            conf_thresh = float(current_config.get("conf_thresh", 0.3))
+            iou_thresh = float(current_config.get("iou_thresh", 0.45))
+            no_video = current_config.get("no_video", False)
+
+            # Engine Paths
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            if mode.upper() == "RGB":
+                base_model_path = os.path.join(base_dir, "models", "rgb_normal.engine")
+                motion_model_path = os.path.join(base_dir, "models", "rgb_highlight.engine")
             else:
-                tracker.iou_threshold = 0.1
-                best_track = tracker.get_best_track()
-                if best_track is not None and best_track.is_stationary(frame_window=int(2 * fps)):
-                    tracker.reset()
-                    best_track = None
+                base_model_path = os.path.join(base_dir, "models", "ir_normal.engine")
+                motion_model_path = os.path.join(base_dir, "models", "ir_highlight.engine")
+
+            print(f"[*] Loading TensorRT Engines for Mode: {mode}")
+            without_model = TRTYOLO(base_model_path, conf_thresh=conf_thresh, iou_thresh=iou_thresh)
+            motion_model = TRTYOLO(motion_model_path, conf_thresh=conf_thresh, iou_thresh=iou_thresh)
+
+            orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            if mode.upper() == "RGB":
+                tracker = RGBTracker(similarity_threshold=0.5, max_missing=10, fps=target_fps)
+            else:
+                tracker = IRTracker(iou_threshold=0.1, max_missing=10, fps=target_fps)
+            
+            start_real_time = time.time()
+            frame_idx = 0
+            prev_gray = None
+            prev_pts = None
+
+            print(f"[*] Starting detection loop ({target_fps} FPS)...")
+            
+            while cap.isOpened():
+                if config_event.is_set():
+                    print("[*] Config changed, reloading...")
+                    config_event.clear()
+                    break # Break inner loop to restart with new config
+
+                loop_start = time.time()
                 
-                use_motion = best_track is not None and best_track.missing_frames == 0
-                current_model_name = "Motion Model" if use_motion else "Base Model"
+                if not is_live:
+                    elapsed_real_time = time.time() - start_real_time
+                    target_frame = int(elapsed_real_time * target_fps)
+                    current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    
+                    if current_frame < target_frame:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                 
-                if use_motion:
-                    pred_bboxes = ir_prediction_function(best_track)
-                    input_frame = apply_highlight_ir(frame, pred_bboxes)
-                    model = motion_model
+                ret, frame = cap.read()
+                if not ret:
+                    if not is_live: # End of video
+                        print("[*] End of video stream. Looping video...")
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        start_real_time = time.time()
+                        continue
+                    else:
+                        break
+
+                # Process Frame
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                bg_dx, bg_dy = 0.0, 0.0
+                
+                if prev_gray is not None:
+                    if prev_pts is None or len(prev_pts) < 10:
+                        prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+                    if prev_pts is not None and len(prev_pts) > 0:
+                        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_pts, None)
+                        if curr_pts is not None and status is not None:
+                            status = status.flatten()
+                            good_new = curr_pts[status == 1]
+                            good_old = prev_pts[status == 1]
+                            if len(good_new) > 0:
+                                diffs = good_new - good_old
+                                bg_dx = np.median(diffs[:, 0])
+                                bg_dy = np.median(diffs[:, 1])
+                                prev_pts = good_new.reshape(-1, 1, 2)
+                            else:
+                                prev_pts = None
+                prev_gray = gray
+                
+                if mode.upper() == "RGB":
+                    best_track = tracker.get_best_track() 
+                    if best_track is not None and best_track.is_stationary(frame_window=int(2 * target_fps)):
+                        tracker.reset()
+                        best_track = None
+                    
+                    use_motion = best_track is not None and best_track.missing_frames == 0
+                    current_model_name = "Motion Model" if use_motion else "Base Model"
+                    if use_motion:
+                        pred_bboxes = rgb_prediction_function(best_track)
+                        input_frame = apply_highlight_rgb(frame, pred_bboxes)
+                        model = motion_model
+                    else:
+                        input_frame = frame
+                        model = without_model
+                    
+                    detections = model.predict(input_frame)
+                    embeddings = [None] * len(detections)
+                    tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
                 else:
-                    input_frame = frame
-                    model = without_model
+                    tracker.iou_threshold = 0.1
+                    best_track = tracker.get_best_track()
+                    if best_track is not None and best_track.is_stationary(frame_window=int(2 * target_fps)):
+                        tracker.reset()
+                        best_track = None
+                    
+                    use_motion = best_track is not None and best_track.missing_frames == 0
+                    current_model_name = "Motion Model" if use_motion else "Base Model"
+                    
+                    if use_motion:
+                        pred_bboxes = ir_prediction_function(best_track)
+                        input_frame = apply_highlight_ir(frame, pred_bboxes)
+                        model = motion_model
+                    else:
+                        input_frame = frame
+                        model = without_model
 
-                # Inference via TensorRT
-                detections = model.predict(input_frame)
-                tracker.update(detections, frame_idx, frame_width=orig_w, frame_height=orig_h, bg_dx=bg_dx, bg_dy=bg_dy)
+                    detections = model.predict(input_frame)
+                    tracker.update(detections, frame_idx, frame_width=orig_w, frame_height=orig_h, bg_dx=bg_dx, bg_dy=bg_dy)
 
-            active_tracks_count = 0
-            best_active = None
-            best_active_score = -1.0
-            
-            all_tracks_info = []
-            
-            for t in tracker.tracks:
-                if t.missing_frames > 0: continue
-                active_tracks_count += 1
-                x, y, w, h = map(int, t.bbox)
-                sim_val = getattr(t, 'sim', 0.0)
-                all_tracks_info.append({
-                    "id": t.track_id, 
-                    "bbox": [x, y, w, h], 
-                    "sim": float(sim_val)
-                })
+                active_tracks_count = 0
+                best_active = None
+                best_active_score = -1.0
                 
-                score = min(len(t.history), int(2 * fps)) / (2 * fps) * 0.5 + sim_val * 0.5
-                if score > best_active_score:
-                    best_active_score = score
-                    best_active = t
-
-            loop_end = time.time()
-            elapsed = loop_end - loop_start
-            actual_fps = 1.0 / elapsed if elapsed > 0 else 0
-            
-            telemetry = {
-                "fps": f"{actual_fps:.1f}",
-                "active_tracks": str(active_tracks_count),
-                "model": current_model_name,
-                "frame": str(frame_idx),
-                "device": f"EDGE (TRT)",
-                "tracks": all_tracks_info
-            }
-
-            if best_active is not None:
-                bx, by, bw, bh = best_active.bbox
-                tcx = int(bx + bw / 2)
-                tcy = int(by + bh / 2)
-                vel = 0.0
-                if len(best_active.history) >= 2:
-                    prev_b = best_active.history[-2]
-                    vel = np.hypot((bx + bw/2) - (prev_b[0] + prev_b[2]/2),
-                                   (by + bh/2) - (prev_b[1] + prev_b[3]/2))
-                telemetry.update({
-                    "target_id": str(best_active.track_id),
-                    "target_pos": f"({tcx}, {tcy})",
-                    "target_size": f"{int(bw)}x{int(bh)}",
-                    "target_sim": f"{getattr(best_active, 'sim', 0.0):.2f}",
-                    "target_vel": f"{vel:.1f} px/f",
-                    "track_age": str(len(best_active.history)),
-                })
-
-            # Send over network
-            json_bytes = json.dumps(telemetry).encode('utf-8')
-            json_size = len(json_bytes)
-            
-            jpeg_bytes = b""
-            if not args.no_video:
-                _, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                jpeg_bytes = encoded.tobytes()
+                all_tracks_info = []
                 
-            payload_size = 4 + json_size + len(jpeg_bytes)
-            header = struct.pack("Q", payload_size)
-            json_header = struct.pack("I", json_size)
-            
-            try:
-                client_socket.sendall(header)
-                client_socket.sendall(json_header)
-                client_socket.sendall(json_bytes)
-                if len(jpeg_bytes) > 0:
-                    client_socket.sendall(jpeg_bytes)
-            except Exception as e:
-                print(f"[-] Connection lost: {e}")
-                break
+                for t in tracker.tracks:
+                    if t.missing_frames > 0: continue
+                    active_tracks_count += 1
+                    x, y, w, h = map(int, t.bbox)
+                    sim_val = getattr(t, 'sim', 0.0)
+                    all_tracks_info.append({
+                        "id": t.track_id, 
+                        "bbox": [x, y, w, h], 
+                        "sim": float(sim_val)
+                    })
+                    
+                    score = min(len(t.history), int(2 * target_fps)) / (2 * target_fps) * 0.5 + sim_val * 0.5
+                    if score > best_active_score:
+                        best_active_score = score
+                        best_active = t
+
+                loop_end = time.time()
+                elapsed = loop_end - loop_start
+                actual_fps = 1.0 / elapsed if elapsed > 0 else 0
                 
-            frame_idx += 1
-            
+                telemetry = {
+                    "fps": f"{actual_fps:.1f}",
+                    "active_tracks": str(active_tracks_count),
+                    "model": current_model_name,
+                    "frame": str(frame_idx),
+                    "device": f"EDGE (TRT)",
+                    "tracks": all_tracks_info
+                }
+
+                if best_active is not None:
+                    bx, by, bw, bh = best_active.bbox
+                    tcx = int(bx + bw / 2)
+                    tcy = int(by + bh / 2)
+                    vel = 0.0
+                    if len(best_active.history) >= 2:
+                        prev_b = best_active.history[-2]
+                        vel = np.hypot((bx + bw/2) - (prev_b[0] + prev_b[2]/2),
+                                       (by + bh/2) - (prev_b[1] + prev_b[3]/2))
+                    telemetry.update({
+                        "target_id": str(best_active.track_id),
+                        "target_pos": f"({tcx}, {tcy})",
+                        "target_size": f"{int(bw)}x{int(bh)}",
+                        "target_sim": f"{getattr(best_active, 'sim', 0.0):.2f}",
+                        "target_vel": f"{vel:.1f} px/f",
+                        "track_age": str(len(best_active.history)),
+                    })
+
+                # Send over network
+                json_bytes = json.dumps(telemetry).encode('utf-8')
+                json_size = len(json_bytes)
+                
+                jpeg_bytes = b""
+                if not no_video:
+                    _, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    jpeg_bytes = encoded.tobytes()
+                    
+                payload_size = 4 + json_size + len(jpeg_bytes)
+                header = struct.pack("Q", payload_size)
+                json_header = struct.pack("I", json_size)
+                
+                try:
+                    client_socket.sendall(header)
+                    client_socket.sendall(json_header)
+                    client_socket.sendall(json_bytes)
+                    if len(jpeg_bytes) > 0:
+                        client_socket.sendall(jpeg_bytes)
+                except Exception as e:
+                    print(f"[-] Connection lost: {e}")
+                    # Force exit to reconnect in outer bash loop if needed
+                    sys.exit(1)
+                    
+                frame_idx += 1
+                
     except KeyboardInterrupt:
         print("[*] Stopped by user.")
     finally:

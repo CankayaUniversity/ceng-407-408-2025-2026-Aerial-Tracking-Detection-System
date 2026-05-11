@@ -15,8 +15,34 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ultralytics import YOLO
 from core.tracker_rgb import Tracker as RGBTracker, prediction_function as rgb_prediction_function
+from core.tracker_ir import Tracker as IRTracker, prediction_function as ir_prediction_function
 from core.utils import apply_highlight_test as apply_highlight_rgb
 from core.inference import detection_and_featuremap
+
+def apply_highlight_ir(frame, pred_bboxes, intensity=0.5, expand_ratio=3.0):
+    if len(frame.shape) == 2:
+        input_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    else:
+        input_frame = frame.copy()
+    if not pred_bboxes:
+        return input_frame
+        
+    if len(pred_bboxes) > 0 and not isinstance(pred_bboxes[0], (list, tuple, np.ndarray)):
+        pred_bboxes = [pred_bboxes]
+        
+    h, w, _ = input_frame.shape
+    for pred_bbox in pred_bboxes:
+        px, py, pw, ph = pred_bbox
+        cx, cy = px + (pw / 2), py + (ph / 2)
+        new_w, new_h = pw * expand_ratio, ph * expand_ratio
+        nx1 = int(max(0, cx - (new_w / 2)))
+        ny1 = int(max(0, cy - (new_h / 2)))
+        nx2 = int(min(w, cx + (new_w / 2)))
+        ny2 = int(min(h, cy + (new_h / 2)))
+        blue_ch = input_frame[ny1:ny2, nx1:nx2, 0].astype(np.float32)
+        blue_ch += (255 * intensity)
+        input_frame[ny1:ny2, nx1:nx2, 0] = np.clip(blue_ch, 0, 255).astype(np.uint8)
+    return input_frame
 
 def discover_server(udp_port=50050, timeout=30):
     print(f"[*] Listening for Main Hub broadcast on UDP port {udp_port}...")
@@ -45,8 +71,9 @@ def main():
     parser = argparse.ArgumentParser(description="Jetson Edge Node for Aerial Tracking")
     parser.add_argument("--video", type=str, default="0", help="Path to video file or camera index (default: 0)")
     parser.add_argument("--no-video", action="store_true", help="Send only telemetry, do not send video frames to save bandwidth/CPU")
-    parser.add_argument("--base-model", type=str, default="models/rgb_normal.pt", help="Path to base YOLO model/engine")
-    parser.add_argument("--motion-model", type=str, default="models/rgb_highlight.pt", help="Path to motion YOLO model/engine")
+    parser.add_argument("--mode", type=str, default="RGB", choices=["RGB", "IR"], help="Processing mode: RGB or IR")
+    parser.add_argument("--base-model", type=str, default=None, help="Path to base YOLO model/engine (overrides default)")
+    parser.add_argument("--motion-model", type=str, default=None, help="Path to motion YOLO model/engine (overrides default)")
     args = parser.parse_args()
 
     # Auto-discover main server
@@ -66,8 +93,14 @@ def main():
         sys.exit(1)
 
     # Load YOLO models
-    base_model_path = args.base_model
-    motion_model_path = args.motion_model
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    if args.mode.upper() == "RGB":
+        base_model_path = args.base_model or os.path.join(base_dir, "models", "rgb_normal.pt")
+        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "rgb_highlight.pt")
+    else:
+        base_model_path = args.base_model or os.path.join(base_dir, "models", "ir_normal.pt")
+        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "ir_highlight.pt")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[*] Loading models on {device}...")
@@ -88,7 +121,10 @@ def main():
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    tracker = RGBTracker(similarity_threshold=0.5, max_missing=10, fps=fps)
+    if args.mode.upper() == "RGB":
+        tracker = RGBTracker(similarity_threshold=0.5, max_missing=10, fps=fps)
+    else:
+        tracker = IRTracker(iou_threshold=0.1, max_missing=10, fps=fps)
     
     start_real_time = time.time()
     frame_idx = 0
@@ -138,31 +174,59 @@ def main():
                             prev_pts = None
             prev_gray = gray
             
-            best_track = tracker.get_best_track() 
-            if best_track is not None and best_track.is_stationary(frame_window=int(2 * fps)):
-                tracker.reset()
-                best_track = None
-            
-            use_motion = best_track is not None and best_track.missing_frames == 0
-            current_model_name = "Motion Model" if use_motion else "Base Model"
-            if use_motion:
-                pred_bboxes = rgb_prediction_function(best_track)
-                input_frame = apply_highlight_rgb(frame, pred_bboxes)
-                model = motion_model
+            if args.mode.upper() == "RGB":
+                best_track = tracker.get_best_track() 
+                if best_track is not None and best_track.is_stationary(frame_window=int(2 * fps)):
+                    tracker.reset()
+                    best_track = None
+                
+                use_motion = best_track is not None and best_track.missing_frames == 0
+                current_model_name = "Motion Model" if use_motion else "Base Model"
+                if use_motion:
+                    pred_bboxes = rgb_prediction_function(best_track)
+                    input_frame = apply_highlight_rgb(frame, pred_bboxes)
+                    model = motion_model
+                else:
+                    input_frame = frame
+                    model = without_model
+                
+                results, feat_map = detection_and_featuremap(model, input_frame, conf=0.30)
+                detections, embeddings = [], []
+                for r in results:
+                    for box in r.boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        bbox = [x1, y1, x2 - x1, y2 - y1]
+                        detections.append(bbox)
+                        # We skip ROI embedder for edge speed unless needed
+                        embeddings.append(None)
+                tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
             else:
-                input_frame = frame
-                model = without_model
-            
-            results, feat_map = detection_and_featuremap(model, input_frame, conf=0.30)
-            detections, embeddings = [], []
-            for r in results:
-                for box in r.boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    bbox = [x1, y1, x2 - x1, y2 - y1]
-                    detections.append(bbox)
-                    # We skip ROI embedder for edge speed unless needed
-                    embeddings.append(None)
-            tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
+                tracker.iou_threshold = 0.1
+                best_track = tracker.get_best_track()
+                if best_track is not None and best_track.is_stationary(frame_window=int(2 * fps)):
+                    tracker.reset()
+                    best_track = None
+                
+                use_motion = best_track is not None and best_track.missing_frames == 0
+                current_model_name = "Motion Model" if use_motion else "Base Model"
+                
+                if use_motion:
+                    pred_bboxes = ir_prediction_function(best_track)
+                    input_frame = apply_highlight_ir(frame, pred_bboxes)
+                    model = motion_model
+                else:
+                    input_frame = frame
+                    model = without_model
+
+                results = model.predict(input_frame, imgsz=640, verbose=False, conf=0.30)
+                detections = []
+                for r in results:
+                    for box in r.boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        bbox = [x1, y1, x2 - x1, y2 - y1]
+                        detections.append(bbox)
+                        
+                tracker.update(detections, frame_idx, frame_width=orig_w, frame_height=orig_h, bg_dx=bg_dx, bg_dy=bg_dy)
 
             active_tracks_count = 0
             best_active = None

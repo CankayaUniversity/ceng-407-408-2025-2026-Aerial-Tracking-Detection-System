@@ -1,96 +1,124 @@
-# Jetson Nano Deployment & Docker Guide
+# Jetson Nano Edge Node - Deployment Guide
 
-Bu doküman, Aerial Tracking Detection System projesinin **Edge Node (Uç Cihaz)** tarafının Jetson Nano üzerinde Docker kullanılarak sıfırdan nasıl ayağa kaldırılacağını açıklamaktadır.
+This document outlines how to set up and deploy the Aerial Tracking Detection System **Edge Node** on a Jetson Nano using Docker.
 
 ---
 
-## 1. Faz: Dosya Transferi (Ana Bilgisayar -> Jetson)
+## Phase 1: Preparation on Main PC (Windows/Mac)
 
-Modelinizi, test videonuzu ve projeye ait olan Edge script'lerini Jetson'a aktarmanız gerekmektedir. Windows PowerShell veya Mac Terminalinizden şu komutları sırasıyla çalıştırın:
+Since the Jetson Nano environment does not have the `ultralytics` package installed, you must first convert your PyTorch (`.pt`) models to ONNX format on your Main PC.
 
+1. Run the transform script on your main machine:
 ```bash
-# Modellerinizin tamamını gönderin (-r ile)
-scp -r models/ jetson@<JETSON_IP_ADRESI>:/home/jetson/models/
-
-# Test videonuzu gönderin
-scp test_video.mp4 jetson@<JETSON_IP_ADRESI>:/home/jetson/
-
-# Edge Node Script'ini gönderin
-scp scripts/jetson_edge_node.py jetson@<JETSON_IP_ADRESI>:/home/jetson/
-
-# Tracker ve Inference kütüphanelerini gönderin (-r parametresi ile)
-scp -r core/ jetson@<JETSON_IP_ADRESI>:/home/jetson/core/
+python models/transform.py
 ```
+*(This will generate `.onnx` files in your `models/` directory using Jetson-safe settings like `opset=12` and `end2end=False`)*
 
----
-
-## 2. Faz: Docker Konteynerinin Kurulumu ve Başlatılması
-
-Bağımlılık çakışmalarını önlemek için NVIDIA'nın optimize edilmiş Ultralytics konteynerini kullanıyoruz. Jetson terminaline SSH ile bağlandıktan sonra şu komutu çalıştırın:
-
+2. Transfer the required files to the Jetson Nano:
 ```bash
-# --runtime nvidia: Konteynerin GPU'yu kullanabilmesini sağlar
-# -v /home/jetson:/home/jetson : Dosya senkronizasyonu yapar (Jetson'a attığımız dosyalar anında içeride görünür)
-# --network host: Jetson'un ağ üzerinden (UDP Broadcast) Ana Bilgisayarı bulabilmesi için ağ katmanını paylaşır
-sudo docker run -it --network host --runtime nvidia -v /home/jetson:/home/jetson ultralytics/ultralytics:latest-aarch64 bash
-```
-> **Not:** Konteynerin Ana Bilgisayarı (UDP 50050 portu üzerinden) otomatik bulabilmesi için `--network host` (veya `--ipc=host` ile birlikte) parametresi hayati önem taşır.
+# Transfer the edge code
+scp -r jetson_edge/ jetson@<JETSON_IP_ADDRESS>:/home/jetson/
 
----
+# Transfer the generated ONNX models
+scp -r models/*.onnx jetson@<JETSON_IP_ADDRESS>:/home/jetson/jetson_edge/models/
 
-## 3. Faz: Konteyner İçi Bağımlılıkların Kurulması
-
-Konteynerin içine girdikten sonra (Terminal `root@...` olduğunda) sistemde eksik olabilecek kütüphaneleri yükleyin:
-
-```bash
-apt update
-apt install nano -y
-pip3 install opencv-python
+# Transfer a test video (e.g., 5.mp4)
+scp 5.mp4 jetson@<JETSON_IP_ADDRESS>:/home/jetson/jetson_edge/
 ```
 
 ---
 
-## 4. Faz: TensorRT Optimizasyonu (Model Export)
+## Phase 2: Docker Environment Setup (One-time only)
 
-Jetson üzerinde donanım hızlandırmalı maksimum FPS almak için, kullandığınız `.pt` modellerini `end2end=False` parametresiyle `.engine` formatına çevirmemiz şarttır.
+To ensure a stable environment without dependency conflicts, we use a custom Docker container built on top of the NVIDIA L4T PyTorch base image. 
 
-Konteyner içerisinde şu komutu (kullandığınız her model için) çalıştırın:
+If you haven't created the `jetson_edge_image` yet, follow these steps:
 
+1. **Start the base NVIDIA container:**
 ```bash
-python3 -c "from ultralytics import YOLO; model = YOLO('/home/jetson/models/rgb_normal.pt'); model.export(format='engine', device=0, half=True, imgsz=640, end2end=False, workspace=1024)"
+sudo docker run -it --network host --runtime nvidia nvcr.io/nvidia/l4t-pytorch:r32.7.1-pth1.10-py3 bash
 ```
-*(Bunu `rgb_highlight.pt`, `ir_normal.pt` ve `ir_highlight.pt` modelleriniz için tekrarlayıp hepsini `.engine` formatına çevirebilirsiniz. Optimizasyon yapmazsanız `.pt` halleri de çalışacaktır ancak FPS düşük olur.)*
+
+2. **Install OpenCV inside the container:**
+```bash
+apt-get update
+apt-get install -y python3-opencv python3-scipy python3-numpy
+exit
+```
+
+3. **Save the container as a new image:**
+Find the container ID and commit it to create your persistent image:
+```bash
+sudo docker ps -a  # Find the ID of the container you just exited
+sudo docker commit <CONTAINER_ID> jetson_edge_image
+```
 
 ---
 
-## 5. Faz: Sistemi Başlatma ve Ağ Bağlantısı
+## Phase 3: Starting the Container
 
-Artık her şey hazır. Çizim işlemleri (HUD) ve arayüz yükü Ana Bilgisayarda olduğu için Jetson sadece "headless" olarak çalışacaktır.
+Whenever you want to run the system, start your custom container using the following command:
 
-### Adım 5.1: Ana Bilgisayarı Hazırlama
-Ana bilgisayarınızda (Windows/Mac) uygulamanızı başlatın ve Jetson'ı beklemeye alın:
-1. `python3 main.py`
-2. Üst menüden **"+ Add Edge Channel"** butonuna tıklayın.
-3. **"Listen for Connection"** butonuna basarak dinlemeyi başlatın.
-
-### Adım 5.2: Jetson Edge Node'u Başlatma
-Konteynerinizin içindeyken aşağıdaki komutla test videonuz üzerinden takibi başlatın.
-
-**Video Dosyası ile RGB Modunda Test (Bant Genişliği Tasarruflu):**
 ```bash
-python3 /home/jetson/jetson_edge_node.py \
-  --mode RGB \
-  --video /home/jetson/test_video.mp4 \
-  --no-video
+sudo docker run -it --ipc=host --network host --runtime nvidia \
+  -v /home/jetson:/home/jetson \
+  jetson_edge_image bash
 ```
-*(Eğer `--base-model` ve `--motion-model` belirtmezseniz sistem otomatik olarak `models/rgb_normal.pt` (veya engine) yollarını kullanır.)*
 
-**Kızılötesi (IR) Kamerası ile Canlı Kullanım:**
+> **Parameter Breakdown:**
+> - `--runtime nvidia`: Grants the container access to the Jetson's GPU and TensorRT.
+> - `-v /home/jetson:/home/jetson`: Syncs the file system so you can access the files you transferred via SCP.
+> - `--network host` & `--ipc=host`: Shares the host network stack, allowing the container to automatically discover the Main Hub via UDP broadcasts.
+
+---
+
+## Phase 4: TensorRT Engine Generation (Inside Jetson Container)
+
+To get maximum FPS with hardware acceleration, we must compile the ONNX files into TensorRT `.engine` files. Since we don't use Python/Ultralytics on the Jetson, we use the native `trtexec` binary.
+
+Run these commands inside your running container (this takes ~5-15 minutes per model):
+
 ```bash
-python3 /home/jetson/jetson_edge_node.py \
-  --mode IR \
-  --video 0
-```
-> Eğer modelleri engine formatına çevirdiyseniz komutun sonuna şunu ekleyin: `--base-model models/ir_normal.engine --motion-model models/ir_highlight.engine`
+cd /home/jetson/jetson_edge
 
-Kod başlatıldığı an `[*] Listening for Main Hub broadcast...` yazısı belirecek ve birkaç saniye içinde Ana bilgisayarınızı otomatik olarak bulup (`[+] Connected to Main Hub.`) işlemlere başlayacaktır.
+# RGB Models
+/usr/src/tensorrt/bin/trtexec --onnx=models/rgb_normal.onnx --saveEngine=models/rgb_normal.engine --workspace=1024 --fp16
+/usr/src/tensorrt/bin/trtexec --onnx=models/rgb_highlight.onnx --saveEngine=models/rgb_highlight.engine --workspace=1024 --fp16
+
+# IR Models (if applicable)
+/usr/src/tensorrt/bin/trtexec --onnx=models/ir_normal.onnx --saveEngine=models/ir_normal.engine --workspace=1024 --fp16
+/usr/src/tensorrt/bin/trtexec --onnx=models/ir_highlight.onnx --saveEngine=models/ir_highlight.engine --workspace=1024 --fp16
+```
+*(Once generated, you do not need to run this step again unless you change your `.onnx` models.)*
+
+---
+
+## Phase 5: Starting the Edge Node
+
+### Step 5.1: Prepare the Main PC
+1. Start your main desktop application (`python main.py`).
+2. Click the **"+ Add Edge Channel"** button.
+3. Click **"Listen for Connection"** to wait for the Jetson.
+
+### Step 5.2: Launch on Jetson
+Run the edge script inside the Jetson container. The script will automatically look for the `*.engine` files you generated.
+
+**Standard Run (RGB Mode with video file):**
+```bash
+cd /home/jetson/jetson_edge
+python3 jetson_edge_node.py --video 5.mp4
+```
+
+**Optimize with Frame Skipping (`--skip-frames`):**
+To drastically improve FPS, you can force the AI model to skip frames, relying on the optical flow tracker for the gaps:
+```bash
+python3 jetson_edge_node.py --video 5.mp4 --skip-frames 1
+```
+*(Using `--skip-frames 1` means it detects 1 frame, tracks 1 frame, detects 1 frame... effectively doubling the FPS.)*
+
+**Infrared (IR) Mode:**
+```bash
+python3 jetson_edge_node.py --video 0 --mode IR
+```
+
+As soon as the script starts, it will output `[*] Listening for Main Hub broadcast on UDP port 50050...` and connect automatically within a few seconds (`[+] Connected to Main Hub.`).

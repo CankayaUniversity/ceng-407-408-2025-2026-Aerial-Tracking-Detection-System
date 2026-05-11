@@ -7,42 +7,12 @@ import struct
 import json
 import argparse
 import numpy as np
-import torch
-from datetime import datetime
 
-# Add parent directory to path so we can import core modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from ultralytics import YOLO
-from core.tracker_rgb import Tracker as RGBTracker, prediction_function as rgb_prediction_function
-from core.tracker_ir import Tracker as IRTracker, prediction_function as ir_prediction_function
-from core.utils import apply_highlight_test as apply_highlight_rgb
-from core.inference import detection_and_featuremap
-
-def apply_highlight_ir(frame, pred_bboxes, intensity=0.5, expand_ratio=3.0):
-    if len(frame.shape) == 2:
-        input_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-    else:
-        input_frame = frame.copy()
-    if not pred_bboxes:
-        return input_frame
-        
-    if len(pred_bboxes) > 0 and not isinstance(pred_bboxes[0], (list, tuple, np.ndarray)):
-        pred_bboxes = [pred_bboxes]
-        
-    h, w, _ = input_frame.shape
-    for pred_bbox in pred_bboxes:
-        px, py, pw, ph = pred_bbox
-        cx, cy = px + (pw / 2), py + (ph / 2)
-        new_w, new_h = pw * expand_ratio, ph * expand_ratio
-        nx1 = int(max(0, cx - (new_w / 2)))
-        ny1 = int(max(0, cy - (new_h / 2)))
-        nx2 = int(min(w, cx + (new_w / 2)))
-        ny2 = int(min(h, cy + (new_h / 2)))
-        blue_ch = input_frame[ny1:ny2, nx1:nx2, 0].astype(np.float32)
-        blue_ch += (255 * intensity)
-        input_frame[ny1:ny2, nx1:nx2, 0] = np.clip(blue_ch, 0, 255).astype(np.uint8)
-    return input_frame
+# We ensure we ONLY import from the current directory, NOT from `core` which might crash
+from tracker_rgb import Tracker as RGBTracker, prediction_function as rgb_prediction_function
+from tracker_ir import Tracker as IRTracker, prediction_function as ir_prediction_function
+from utils import apply_highlight_test as apply_highlight_rgb, apply_highlight_ir
+from trt_infer import TRTYOLO
 
 def discover_server(udp_port=50050, timeout=30):
     print(f"[*] Listening for Main Hub broadcast on UDP port {udp_port}...")
@@ -68,12 +38,12 @@ def discover_server(udp_port=50050, timeout=30):
         udp_socket.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Jetson Edge Node for Aerial Tracking")
+    parser = argparse.ArgumentParser(description="Jetson Edge Node (Pure TensorRT) for Aerial Tracking")
     parser.add_argument("--video", type=str, default="0", help="Path to video file or camera index (default: 0)")
     parser.add_argument("--no-video", action="store_true", help="Send only telemetry, do not send video frames to save bandwidth/CPU")
     parser.add_argument("--mode", type=str, default="RGB", choices=["RGB", "IR"], help="Processing mode: RGB or IR")
-    parser.add_argument("--base-model", type=str, default=None, help="Path to base YOLO model/engine (overrides default)")
-    parser.add_argument("--motion-model", type=str, default=None, help="Path to motion YOLO model/engine (overrides default)")
+    parser.add_argument("--base-model", type=str, default=None, help="Path to base TensorRT .engine model")
+    parser.add_argument("--motion-model", type=str, default=None, help="Path to motion TensorRT .engine model")
     args = parser.parse_args()
 
     # Auto-discover main server
@@ -92,20 +62,18 @@ def main():
         print(f"[-] Connection failed: {e}")
         sys.exit(1)
 
-    # Load YOLO models
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
+    # Engine Paths
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     if args.mode.upper() == "RGB":
-        base_model_path = args.base_model or os.path.join(base_dir, "models", "rgb_normal.pt")
-        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "rgb_highlight.pt")
+        base_model_path = args.base_model or os.path.join(base_dir, "models", "rgb_normal.engine")
+        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "rgb_highlight.engine")
     else:
-        base_model_path = args.base_model or os.path.join(base_dir, "models", "ir_normal.pt")
-        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "ir_highlight.pt")
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[*] Loading models on {device}...")
-    without_model = YOLO(base_model_path, task='detect')
-    motion_model = YOLO(motion_model_path, task='detect')
+        base_model_path = args.base_model or os.path.join(base_dir, "models", "ir_normal.engine")
+        motion_model_path = args.motion_model or os.path.join(base_dir, "models", "ir_highlight.engine")
+
+    print(f"[*] Loading TensorRT Engines...")
+    without_model = TRTYOLO(base_model_path)
+    motion_model = TRTYOLO(motion_model_path)
 
     # Video Setup
     is_live = args.video.isdigit()
@@ -137,14 +105,12 @@ def main():
         while cap.isOpened():
             loop_start = time.time()
             
-            # Real-time synchronization for video files
             if not is_live:
                 elapsed_real_time = time.time() - start_real_time
                 target_frame = int(elapsed_real_time * fps)
                 current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 
                 if current_frame < target_frame:
-                    # Skip to the target frame
                     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             
             ret, frame = cap.read()
@@ -190,15 +156,9 @@ def main():
                     input_frame = frame
                     model = without_model
                 
-                results, feat_map = detection_and_featuremap(model, input_frame, conf=0.30)
-                detections, embeddings = [], []
-                for r in results:
-                    for box in r.boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        bbox = [x1, y1, x2 - x1, y2 - y1]
-                        detections.append(bbox)
-                        # We skip ROI embedder for edge speed unless needed
-                        embeddings.append(None)
+                # Inference via TensorRT
+                detections = model.predict(input_frame)
+                embeddings = [None] * len(detections) # No embeddings on edge
                 tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
             else:
                 tracker.iou_threshold = 0.1
@@ -218,14 +178,8 @@ def main():
                     input_frame = frame
                     model = without_model
 
-                results = model.predict(input_frame, imgsz=640, verbose=False, conf=0.30)
-                detections = []
-                for r in results:
-                    for box in r.boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        bbox = [x1, y1, x2 - x1, y2 - y1]
-                        detections.append(bbox)
-                        
+                # Inference via TensorRT
+                detections = model.predict(input_frame)
                 tracker.update(detections, frame_idx, frame_width=orig_w, frame_height=orig_h, bg_dx=bg_dx, bg_dy=bg_dy)
 
             active_tracks_count = 0
@@ -250,7 +204,6 @@ def main():
                     best_active_score = score
                     best_active = t
 
-            # Telemetry dict
             loop_end = time.time()
             elapsed = loop_end - loop_start
             actual_fps = 1.0 / elapsed if elapsed > 0 else 0
@@ -260,7 +213,7 @@ def main():
                 "active_tracks": str(active_tracks_count),
                 "model": current_model_name,
                 "frame": str(frame_idx),
-                "device": f"EDGE ({device.upper()})",
+                "device": f"EDGE (TRT)",
                 "tracks": all_tracks_info
             }
 
@@ -283,7 +236,6 @@ def main():
                 })
 
             # Send over network
-            # Protocol: [Payload Size 8 bytes] [JSON Size 4 bytes] [JSON Bytes] [JPEG Bytes]
             json_bytes = json.dumps(telemetry).encode('utf-8')
             json_size = len(json_bytes)
             

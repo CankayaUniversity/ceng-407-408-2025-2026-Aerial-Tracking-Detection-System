@@ -22,7 +22,7 @@ def resource_path(relative_path):
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QFrame, QGridLayout, QSizePolicy, QComboBox, QSlider,
-    QTextEdit
+    QTextEdit, QSpinBox, QDoubleSpinBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QImage, QPixmap, QFont
@@ -848,7 +848,7 @@ class EdgeNetworkThread(QThread):
             self.server_socket.close()
             return
             
-        self.conn.settimeout(5.0)
+        self.conn.settimeout(60.0)
         data_buf = b""
         payload_size_struct = struct.calcsize("Q")
         
@@ -1111,6 +1111,7 @@ class EdgeNetworkChannel(QFrame):
         self.lbl_status.setText(f"Status: {status}")
         if "Connected" in status:
             self.lbl_status.setStyleSheet("color: #00ff00; font-weight: bold; border: none; background: transparent;")
+            self.apply_remote_config()
         else:
             self.lbl_status.setStyleSheet("color: #ffaa00; font-weight: bold; border: none; background: transparent;")
 

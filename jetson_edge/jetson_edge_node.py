@@ -172,7 +172,9 @@ def main():
                     if current_frame < target_frame:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                 
+                t0 = time.time()
                 ret, frame = cap.read()
+                t_read = time.time() - t0
                 if not ret:
                     if not is_live: # End of video
                         print("[*] End of video stream. Looping video...")
@@ -183,6 +185,7 @@ def main():
                         break
 
                 # Process Frame
+                t0 = time.time()
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 bg_dx, bg_dy = 0.0, 0.0
                 
@@ -196,15 +199,43 @@ def main():
                             good_new = curr_pts[status == 1]
                             good_old = prev_pts[status == 1]
                             if len(good_new) > 0:
-                                diffs = good_new - good_old
+                                good_new_flat = good_new.reshape(-1, 2)
+                                good_old_flat = good_old.reshape(-1, 2)
+                                diffs = good_new_flat - good_old_flat
                                 bg_dx = np.median(diffs[:, 0])
                                 bg_dy = np.median(diffs[:, 1])
                                 prev_pts = good_new.reshape(-1, 1, 2)
                             else:
                                 prev_pts = None
                 prev_gray = gray
+                t_flow = time.time() - t0
                 
-                if mode.upper() == "RGB":
+                t0 = time.time()
+                # Downscale for optical flow to reduce CPU cost
+                gray_small = cv2.resize(gray, (orig_w // 2, orig_h // 2))
+                bg_dx, bg_dy = 0.0, 0.0
+                
+                if prev_gray is not None:
+                    if prev_pts is None or len(prev_pts) < 10:
+                        prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+                    if prev_pts is not None and len(prev_pts) > 0:
+                        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_small, prev_pts, None)
+                        if curr_pts is not None and status is not None:
+                            status = status.flatten()
+                            good_new = curr_pts[status == 1]
+                            good_old = prev_pts[status == 1]
+                            if len(good_new) > 0:
+                                good_new_flat = good_new.reshape(-1, 2)
+                                good_old_flat = good_old.reshape(-1, 2)
+                                diffs = good_new_flat - good_old_flat
+                                # Scale back to full resolution
+                                bg_dx = np.median(diffs[:, 0]) * 2.0
+                                bg_dy = np.median(diffs[:, 1]) * 2.0
+                                prev_pts = good_new.reshape(-1, 1, 2)
+                            else:
+                                prev_pts = None
+                prev_gray = gray_small
+                t_flow = time.time() - t0
                     best_track = tracker.get_best_track() 
                     if best_track is not None and best_track.is_stationary(frame_window=int(2 * target_fps)):
                         tracker.reset()
@@ -221,6 +252,8 @@ def main():
                         model = without_model
                     
                     detections = model.predict(input_frame)
+                    t_detect = time.time() - t0
+                    t0 = time.time()
                     embeddings = [None] * len(detections)
                     tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
                 else:
@@ -242,7 +275,10 @@ def main():
                         model = without_model
 
                     detections = model.predict(input_frame)
+                    t_detect = time.time() - t0
+                    t0 = time.time()
                     tracker.update(detections, frame_idx, frame_width=orig_w, frame_height=orig_h, bg_dx=bg_dx, bg_dy=bg_dy)
+                t_track = time.time() - t0
 
                 active_tracks_count = 0
                 best_active = None
@@ -269,6 +305,18 @@ def main():
                 loop_end = time.time()
                 elapsed = loop_end - loop_start
                 actual_fps = 1.0 / elapsed if elapsed > 0 else 0
+                
+                if frame_idx % 30 == 0:
+                    total_ms = elapsed * 1000
+                    print(
+                        f"[PROFILE] Frame {frame_idx:4d} | "
+                        f"Total: {total_ms:5.1f}ms ({actual_fps:.1f} FPS) | "
+                        f"Read: {t_read*1000:4.1f}ms | "
+                        f"Flow: {t_flow*1000:4.1f}ms | "
+                        f"Detect: {t_detect*1000:5.1f}ms | "
+                        f"Track: {t_track*1000:4.1f}ms | "
+                        f"Tracks: {active_tracks_count}"
+                    )
                 
                 telemetry = {
                     "fps": f"{actual_fps:.1f}",

@@ -4,6 +4,71 @@ import pycuda.autoinit
 import numpy as np
 import cv2
 
+def nms_numpy(boxes, scores, iou_thresh):
+    if len(boxes) == 0:
+        return []
+    
+    boxes_np = np.array(boxes)
+    x1 = boxes_np[:, 0]
+    y1 = boxes_np[:, 1]
+    x2 = boxes_np[:, 0] + boxes_np[:, 2]
+    y2 = boxes_np[:, 1] + boxes_np[:, 3]
+    scores_np = np.array(scores)
+    
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores_np.argsort()[::-1]
+    
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        
+        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+        
+        inds = np.where(ovr <= iou_thresh)[0]
+        order = order[inds + 1]
+        
+    return keep
+
+def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=False, scaleFill=False, scaleup=True, stride=32):
+    shape = im.shape[:2]  # current shape [height, width]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    if not scaleup:
+        r = min(r, 1.0)
+
+    ratio = r, r  # width, height ratios
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+
+    if auto:
+        dw, dh = np.mod(dw, stride), np.mod(dh, stride)
+    elif scaleFill:
+        dw, dh = 0.0, 0.0
+        new_unpad = (new_shape[1], new_shape[0])
+        ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]
+
+    dw /= 2
+    dh /= 2
+
+    if shape[::-1] != new_unpad:
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return im, ratio, (dw, dh)
+
 class TRTYOLO:
     def __init__(self, engine_path, conf_thresh=0.30, iou_thresh=0.45):
         self.conf_thresh = conf_thresh
@@ -33,8 +98,8 @@ class TRTYOLO:
     def predict(self, frame):
         orig_h, orig_w = frame.shape[:2]
         
-        # Preprocessing (YOLOv8 style: resize, BGR->RGB, HWC->CHW, /255.0)
-        img = cv2.resize(frame, (640, 640))
+        # Preprocessing with letterbox to preserve aspect ratio
+        img, ratio, (dw, dh) = letterbox(frame, new_shape=(640, 640))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.transpose((2, 0, 1)).astype(np.float32)
         img /= 255.0
@@ -63,27 +128,32 @@ class TRTYOLO:
         boxes = []
         scores = []
         
-        x_factor = orig_w / 640.0
-        y_factor = orig_h / 640.0
+        r = ratio[0]
         
         for row in out:
             conf = row[4]
             if conf > self.conf_thresh:
                 cx, cy, w, h = row[0], row[1], row[2], row[3]
-                x1 = int((cx - w/2) * x_factor)
-                y1 = int((cy - h/2) * y_factor)
-                width = int(w * x_factor)
-                height = int(h * y_factor)
+                
+                # Undo letterbox padding and scaling
+                cx = (cx - dw) / r
+                cy = (cy - dh) / r
+                w = w / r
+                h = h / r
+                
+                x1 = int(cx - w/2)
+                y1 = int(cy - h/2)
+                width = int(w)
+                height = int(h)
                 
                 boxes.append([x1, y1, width, height])
                 scores.append(float(conf))
                 
         # NMS
-        indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf_thresh, self.iou_thresh)
+        indices = nms_numpy(boxes, scores, self.iou_thresh)
         
         detections = []
-        if len(indices) > 0:
-            for i in indices.flatten():
-                detections.append(boxes[i])
+        for i in indices:
+            detections.append(boxes[i])
                 
         return detections

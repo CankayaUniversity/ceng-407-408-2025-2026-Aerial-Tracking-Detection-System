@@ -292,7 +292,7 @@ class Tracker:
                 assigned_tracks.add(t_idx)
                 assigned_detections.add(d_idx)
             else:
-                print(f"Eşleşmedi id: {t_idx} ")
+                pass  # No match for track id: {t_idx}
         # -------------------------------
         # UNMATCHED TRACKS → PREDICT
         # -------------------------------

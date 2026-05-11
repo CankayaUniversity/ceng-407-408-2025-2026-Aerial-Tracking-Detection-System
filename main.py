@@ -4,6 +4,9 @@ import cv2
 import time
 import torch
 import numpy as np
+import socket
+import struct
+import json
 from datetime import datetime
 
 def resource_path(relative_path):
@@ -777,6 +780,290 @@ class VideoChannel(QFrame):
 
 from PyQt6.QtWidgets import QScrollArea
 
+class AutoDiscoveryThread(QThread):
+    def __init__(self, tcp_port=8485, udp_port=50050):
+        super().__init__()
+        self.tcp_port = tcp_port
+        self.udp_port = udp_port
+        self._run_flag = True
+        
+    def run(self):
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        msg = f"AERIAL_TRACKER_MAIN_HUB:{self.tcp_port}".encode('utf-8')
+        
+        while self._run_flag:
+            try:
+                # 255.255.255.255 is local broadcast
+                udp_socket.sendto(msg, ('255.255.255.255', self.udp_port))
+            except Exception:
+                pass
+            time.sleep(2)
+            
+    def stop(self):
+        self._run_flag = False
+        self.wait()
+
+class EdgeNetworkThread(QThread):
+    change_pixmap_signal = pyqtSignal(np.ndarray)
+    telemetry_signal = pyqtSignal(dict)
+    log_signal = pyqtSignal(str, str)
+    finished_signal = pyqtSignal()
+    status_signal = pyqtSignal(str) # For "Waiting...", "Connected"
+    
+    def __init__(self, port=8485):
+        super().__init__()
+        self.port = port
+        self._run_flag = True
+        self.server_socket = None
+
+    def run(self):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind(('0.0.0.0', self.port))
+            self.server_socket.listen(1)
+            self.server_socket.settimeout(1.0)
+        except Exception as e:
+            self.log_signal.emit("WARN", f"Could not bind to port {self.port}: {e}")
+            self.finished_signal.emit()
+            return
+            
+        self.status_signal.emit("Waiting for edge device...")
+        self.log_signal.emit("INFO", f"Listening for edge connection on port {self.port}...")
+        
+        conn = None
+        while self._run_flag and conn is None:
+            try:
+                conn, addr = self.server_socket.accept()
+                self.status_signal.emit(f"Connected: {addr[0]}")
+                self.log_signal.emit("INFO", f"Edge device connected from {addr[0]}")
+            except socket.timeout:
+                continue
+                
+        if not self._run_flag:
+            if conn: conn.close()
+            self.server_socket.close()
+            return
+            
+        conn.settimeout(5.0)
+        data_buf = b""
+        payload_size_struct = struct.calcsize("Q")
+        
+        try:
+            while self._run_flag:
+                # Read payload size
+                while len(data_buf) < payload_size_struct and self._run_flag:
+                    packet = conn.recv(4096)
+                    if not packet: break
+                    data_buf += packet
+                if not packet or len(data_buf) < payload_size_struct: break
+                
+                packed_msg_size = data_buf[:payload_size_struct]
+                data_buf = data_buf[payload_size_struct:]
+                payload_size = struct.unpack("Q", packed_msg_size)[0]
+                
+                # Read full payload
+                while len(data_buf) < payload_size and self._run_flag:
+                    packet = conn.recv(4096)
+                    if not packet: break
+                    data_buf += packet
+                if not packet or len(data_buf) < payload_size: break
+                
+                payload_data = data_buf[:payload_size]
+                data_buf = data_buf[payload_size:]
+                
+                # Parse payload: [JSON Size (4 bytes)] [JSON Bytes] [JPEG Bytes]
+                json_size = struct.unpack("I", payload_data[:4])[0]
+                json_bytes = payload_data[4:4+json_size]
+                jpeg_bytes = payload_data[4+json_size:]
+                
+                try:
+                    telemetry_dict = json.loads(json_bytes.decode('utf-8'))
+                    self.telemetry_signal.emit(telemetry_dict)
+                except Exception as e:
+                    pass
+                    
+                if len(jpeg_bytes) > 0:
+                    frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        try:
+                            tracks = telemetry_dict.get("tracks", [])
+                            for t in tracks:
+                                x, y, w, h = t["bbox"]
+                                draw_hud_bbox(frame, x, y, w, h, t["id"], sim=t.get("sim", 0.0))
+                        except Exception:
+                            pass
+                        self.change_pixmap_signal.emit(frame)
+                        
+        except Exception as e:
+            self.log_signal.emit("WARN", f"Connection error: {e}")
+            
+        if conn: conn.close()
+        if self.server_socket: self.server_socket.close()
+        self.status_signal.emit("Disconnected.")
+        self.log_signal.emit("INFO", "Edge connection closed.")
+        self.finished_signal.emit()
+
+    def stop(self):
+        self._run_flag = False
+        self.wait()
+
+class EdgeNetworkChannel(QFrame):
+    closed_signal = pyqtSignal(object)
+    
+    def __init__(self, channel_id):
+        super().__init__()
+        self.channel_id = channel_id
+        self.thread = None
+        self.port = 8485 # default port
+        
+        self.setStyleSheet("""
+            QFrame {
+                background-color: #181818;
+                border-radius: 12px;
+                border: 1px solid #333333;
+            }
+        """)
+        
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+        
+        # Left side: Video & Controls
+        left_layout = QVBoxLayout()
+        
+        # Header
+        header_layout = QHBoxLayout()
+        header_lbl = QLabel(f"EDGE CHANNEL {self.channel_id}")
+        header_lbl.setStyleSheet("color: #e0e0e0; font-weight: bold; font-size: 14px; border: none; background: transparent;")
+        header_layout.addWidget(header_lbl)
+        
+        self.lbl_status = QLabel("Status: Idle")
+        self.lbl_status.setStyleSheet("color: #ffaa00; font-weight: bold; border: none; background: transparent;")
+        header_layout.addWidget(self.lbl_status)
+        header_layout.addStretch()
+        
+        self.btn_close = QPushButton("X")
+        self.btn_close.setFixedSize(24, 24)
+        self.btn_close.setStyleSheet("""
+            QPushButton {
+                background-color: #333333;
+                color: #ffffff;
+                border-radius: 12px;
+                font-weight: bold;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #555555;
+            }
+        """)
+        self.btn_close.clicked.connect(self.request_close)
+        header_layout.addWidget(self.btn_close)
+        
+        left_layout.addLayout(header_layout)
+        
+        # Video Display
+        self.video_label = VideoLabel("Waiting for Edge Video Feed...")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setMinimumSize(1, 1)
+        self.video_label.setStyleSheet("""
+            background-color: #000000;
+            border-radius: 10px;
+            color: #808080;
+            font-size: 18px;
+            font-weight: bold;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            border: 2px solid #333333;
+        """)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        left_layout.addWidget(self.video_label)
+        
+        # Controls
+        controls_layout = QHBoxLayout()
+        btn_style = """
+            QPushButton {
+                background-color: #4a362e;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #66483c;
+            }
+            QPushButton:disabled {
+                background-color: #222222;
+                color: #555555;
+            }
+        """
+        
+        self.btn_listen = QPushButton("Listen for Connection")
+        self.btn_listen.setStyleSheet(btn_style)
+        self.btn_listen.clicked.connect(self.toggle_listen)
+        
+        controls_layout.addWidget(self.btn_listen)
+        controls_layout.addStretch()
+        left_layout.addLayout(controls_layout)
+        
+        main_layout.addLayout(left_layout, stretch=3)
+        
+        # Right side: Telemetry + Log
+        right_layout = QVBoxLayout()
+        self.telemetry_panel = TelemetryPanel()
+        right_layout.addWidget(self.telemetry_panel)
+        
+        self.log_panel = LogPanel()
+        right_layout.addWidget(self.log_panel, stretch=1)
+        
+        main_layout.addLayout(right_layout, stretch=1)
+
+    def request_close(self):
+        self.close_channel()
+        self.closed_signal.emit(self)
+
+    def toggle_listen(self):
+        if self.thread is None or not self.thread.isRunning():
+            self.thread = EdgeNetworkThread(port=self.port)
+            self.thread.change_pixmap_signal.connect(self.update_image)
+            self.thread.telemetry_signal.connect(self.telemetry_panel.update_data)
+            self.thread.log_signal.connect(self.log_panel.append_log)
+            self.thread.status_signal.connect(self.update_status)
+            self.thread.finished_signal.connect(self.network_finished)
+            self.thread.start()
+            self.btn_listen.setText("Stop Listening")
+        else:
+            self.thread.stop()
+            self.btn_listen.setText("Listen for Connection")
+            
+    def update_status(self, status):
+        self.lbl_status.setText(f"Status: {status}")
+        if "Connected" in status:
+            self.lbl_status.setStyleSheet("color: #00ff00; font-weight: bold; border: none; background: transparent;")
+        else:
+            self.lbl_status.setStyleSheet("color: #ffaa00; font-weight: bold; border: none; background: transparent;")
+
+    def update_image(self, cv_img):
+        qt_img = self.convert_cv_qt(cv_img)
+        self.video_label.setPixmap(qt_img)
+        
+    def network_finished(self):
+        self.btn_listen.setText("Listen for Connection")
+        self.update_status("Idle")
+        
+    def convert_cv_qt(self, cv_img):
+        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        p = convert_to_Qt_format.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
+        return QPixmap.fromImage(p)
+        
+    def close_channel(self):
+        if self.thread is not None:
+            self.thread.stop()
+
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -821,12 +1108,37 @@ class App(QMainWindow):
             QPushButton:hover {
                 background-color: #3c6648;
             }
+            QPushButton:disabled {
+                background-color: #222222;
+                color: #555555;
+            }
         """)
         self.btn_add_channel.clicked.connect(self.add_channel)
+        
+        self.btn_add_edge_channel = QPushButton("+ Add Edge Channel")
+        self.btn_add_edge_channel.setStyleSheet("""
+            QPushButton {
+                background-color: #4a362e;
+                color: #ffffff;
+                border-radius: 8px;
+                padding: 10px 20px;
+                font-weight: bold;
+                font-size: 15px;
+            }
+            QPushButton:hover {
+                background-color: #66483c;
+            }
+            QPushButton:disabled {
+                background-color: #222222;
+                color: #555555;
+            }
+        """)
+        self.btn_add_edge_channel.clicked.connect(self.add_edge_channel)
         
         header_layout.addWidget(title_lbl)
         header_layout.addStretch()
         header_layout.addWidget(self.btn_add_channel)
+        header_layout.addWidget(self.btn_add_edge_channel)
         
         main_layout.addLayout(header_layout)
         
@@ -890,6 +1202,10 @@ class App(QMainWindow):
         # Add a default channel at startup
         self.add_channel()
         
+        # Start Auto Discovery Thread
+        self.discovery_thread = AutoDiscoveryThread(tcp_port=8485)
+        self.discovery_thread.start()
+        
     def add_channel(self):
         if len(self.channels) >= 4:
             # We limit to 4 channels for layout and performance reasons
@@ -920,18 +1236,27 @@ class App(QMainWindow):
         self.channels.append(new_channel)
         
         if len(self.channels) >= 4:
-            self.btn_add_channel.setText("Max Channels Reached")
             self.btn_add_channel.setEnabled(False)
-            self.btn_add_channel.setStyleSheet("""
-                QPushButton {
-                    background-color: #222222;
-                    color: #555555;
-                    border-radius: 8px;
-                    padding: 10px 20px;
-                    font-weight: bold;
-                    font-size: 15px;
-                }
-            """)
+            self.btn_add_edge_channel.setEnabled(False)
+
+    def add_edge_channel(self):
+        if len(self.channels) >= 4:
+            return
+            
+        self.channel_counter += 1
+        new_channel = EdgeNetworkChannel(self.channel_counter)
+        new_channel.closed_signal.connect(self.remove_channel)
+        
+        idx = len(self.channels)
+        row = idx // 2
+        col = idx % 2
+        
+        self.channels_layout.addWidget(new_channel, row, col)
+        self.channels.append(new_channel)
+        
+        if len(self.channels) >= 4:
+            self.btn_add_channel.setEnabled(False)
+            self.btn_add_edge_channel.setEnabled(False)
 
     def remove_channel(self, channel):
         if channel in self.channels:
@@ -941,21 +1266,8 @@ class App(QMainWindow):
             self.rearrange_channels()
             
             if len(self.channels) < 4:
-                self.btn_add_channel.setText("+ Add Channel")
                 self.btn_add_channel.setEnabled(True)
-                self.btn_add_channel.setStyleSheet("""
-                    QPushButton {
-                        background-color: #2e4a36;
-                        color: #ffffff;
-                        border-radius: 8px;
-                        padding: 10px 20px;
-                        font-weight: bold;
-                        font-size: 15px;
-                    }
-                    QPushButton:hover {
-                        background-color: #3c6648;
-                    }
-                """)
+                self.btn_add_edge_channel.setEnabled(True)
                 
     def rearrange_channels(self):
         for idx, ch in enumerate(self.channels):
@@ -967,6 +1279,7 @@ class App(QMainWindow):
     def closeEvent(self, event):
         for ch in self.channels:
             ch.close_channel()
+        self.discovery_thread.stop()
         event.accept()
 
 if __name__ == "__main__":

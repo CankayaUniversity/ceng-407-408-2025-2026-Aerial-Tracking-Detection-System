@@ -38,6 +38,78 @@ def discover_server(udp_port=50050, timeout=30):
         udp_socket.close()
 
 import threading
+import queue
+
+def capture_thread(cap, frame_queue, config_event, is_live, target_fps, orig_w, orig_h, skip_frames):
+    start_real_time = time.time()
+    frame_idx = 0
+    prev_gray = None
+    prev_pts = None
+
+    while cap.isOpened():
+        if config_event.is_set():
+            try: frame_queue.put(None, timeout=1)
+            except: pass
+            break
+
+        if not is_live:
+            elapsed_real_time = time.time() - start_real_time
+            target_frame = int(elapsed_real_time * target_fps)
+            current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            
+            if current_frame < target_frame:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        
+        t0 = time.time()
+        ret, frame = cap.read()
+        t_read = time.time() - t0
+        
+        if not ret:
+            if not is_live: # End of video
+                print("[*] End of video stream. Looping video...")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                start_real_time = time.time()
+                continue
+            else:
+                try: frame_queue.put(None, timeout=1)
+                except: pass
+                break
+                
+        # Process Frame Flow
+        t0 = time.time()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_small = cv2.resize(gray, (orig_w // 2, orig_h // 2))
+        bg_dx, bg_dy = 0.0, 0.0
+        
+        if prev_gray is not None:
+            if prev_pts is None or len(prev_pts) < 10:
+                prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+            if prev_pts is not None and len(prev_pts) > 0:
+                curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_small, prev_pts, None)
+                if curr_pts is not None and status is not None:
+                    status = status.flatten()
+                    good_new = curr_pts[status == 1]
+                    good_old = prev_pts[status == 1]
+                    if len(good_new) > 0:
+                        good_new_flat = good_new.reshape(-1, 2)
+                        good_old_flat = good_old.reshape(-1, 2)
+                        diffs = good_new_flat - good_old_flat
+                        bg_dx = np.median(diffs[:, 0]) * 2.0
+                        bg_dy = np.median(diffs[:, 1]) * 2.0
+                        prev_pts = good_new.reshape(-1, 1, 2)
+                    else:
+                        prev_pts = None
+        prev_gray = gray_small
+        t_flow = time.time() - t0
+        
+        run_detect = (skip_frames == 0) or (frame_idx % (skip_frames + 1) == 0)
+        
+        try:
+            frame_queue.put((frame_idx, frame, bg_dx, bg_dy, run_detect, t_read, t_flow), timeout=1)
+        except queue.Full:
+            continue
+            
+        frame_idx += 1
 
 current_config = None
 config_event = threading.Event()
@@ -152,10 +224,12 @@ def main():
             else:
                 tracker = IRTracker(iou_threshold=0.1, max_missing=10, fps=target_fps)
             
-            start_real_time = time.time()
-            frame_idx = 0
-            prev_gray = None
-            prev_pts = None
+            frame_queue = queue.Queue(maxsize=3)
+            cap_thread = threading.Thread(
+                target=capture_thread,
+                args=(cap, frame_queue, config_event, is_live, target_fps, orig_w, orig_h, skip_frames)
+            )
+            cap_thread.start()
 
             print(f"[*] Starting detection loop ({target_fps} FPS)...")
             
@@ -163,61 +237,22 @@ def main():
                 if config_event.is_set():
                     print("[*] Config changed, reloading...")
                     config_event.clear()
+                    cap_thread.join()
                     break # Break inner loop to restart with new config
 
                 loop_start = time.time()
                 
-                if not is_live:
-                    elapsed_real_time = time.time() - start_real_time
-                    target_frame = int(elapsed_real_time * target_fps)
-                    current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                try:
+                    item = frame_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
                     
-                    if current_frame < target_frame:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                if item is None:
+                    break # Stream ended
+                    
+                frame_idx, frame, bg_dx, bg_dy, run_detect, t_read, t_flow = item
                 
                 t0 = time.time()
-                ret, frame = cap.read()
-                t_read = time.time() - t0
-                if not ret:
-                    if not is_live: # End of video
-                        print("[*] End of video stream. Looping video...")
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        start_real_time = time.time()
-                        continue
-                    else:
-                        break
-
-                # Process Frame
-                t0 = time.time()
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Downscale for optical flow to reduce CPU cost
-                gray_small = cv2.resize(gray, (orig_w // 2, orig_h // 2))
-                bg_dx, bg_dy = 0.0, 0.0
-                
-                if prev_gray is not None:
-                    if prev_pts is None or len(prev_pts) < 10:
-                        prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
-                    if prev_pts is not None and len(prev_pts) > 0:
-                        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_small, prev_pts, None)
-                        if curr_pts is not None and status is not None:
-                            status = status.flatten()
-                            good_new = curr_pts[status == 1]
-                            good_old = prev_pts[status == 1]
-                            if len(good_new) > 0:
-                                good_new_flat = good_new.reshape(-1, 2)
-                                good_old_flat = good_old.reshape(-1, 2)
-                                diffs = good_new_flat - good_old_flat
-                                # Scale back to full resolution
-                                bg_dx = np.median(diffs[:, 0]) * 2.0
-                                bg_dy = np.median(diffs[:, 1]) * 2.0
-                                prev_pts = good_new.reshape(-1, 1, 2)
-                            else:
-                                prev_pts = None
-                prev_gray = gray_small
-                t_flow = time.time() - t0
-                
-                t0 = time.time()
-                run_detect = (skip_frames == 0) or (frame_idx % (skip_frames + 1) == 0)
                 if mode.upper() == "RGB":
                     best_track = tracker.get_best_track() 
                     if best_track is not None and best_track.is_stationary(frame_window=int(2 * target_fps)):

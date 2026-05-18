@@ -236,8 +236,8 @@ def main():
             while cap.isOpened():
                 if config_event.is_set():
                     print("[*] Config changed, reloading...")
-                    config_event.clear()
                     cap_thread.join()
+                    config_event.clear()
                     break # Break inner loop to restart with new config
 
                 loop_start = time.time()

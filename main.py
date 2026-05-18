@@ -1053,6 +1053,11 @@ class EdgeNetworkChannel(QFrame):
         self.spin_iou.setValue(0.45)
         self.spin_iou.setStyleSheet("background-color: #333333; color: white;")
         
+        self.spin_skip_frames = QSpinBox()
+        self.spin_skip_frames.setRange(0, 30)
+        self.spin_skip_frames.setValue(0)
+        self.spin_skip_frames.setStyleSheet("background-color: #333333; color: white;")
+        
         self.chk_no_video = QCheckBox("No Video")
         self.chk_no_video.setStyleSheet("color: white;")
         
@@ -1073,6 +1078,8 @@ class EdgeNetworkChannel(QFrame):
         controls_layout.addWidget(self.spin_conf)
         controls_layout.addWidget(QLabel("IOU:"))
         controls_layout.addWidget(self.spin_iou)
+        controls_layout.addWidget(QLabel("Skip:"))
+        controls_layout.addWidget(self.spin_skip_frames)
         controls_layout.addWidget(self.chk_no_video)
         controls_layout.addWidget(self.chk_dual_model)
         controls_layout.addWidget(self.btn_apply_config)
@@ -1100,7 +1107,8 @@ class EdgeNetworkChannel(QFrame):
                 "conf_thresh": self.spin_conf.value(),
                 "iou_thresh": self.spin_iou.value(),
                 "no_video": self.chk_no_video.isChecked(),
-                "use_dual_model": self.chk_dual_model.isChecked()
+                "use_dual_model": self.chk_dual_model.isChecked(),
+                "skip_frames": self.spin_skip_frames.value()
             }
             self.thread.send_config(config)
         else:
@@ -1128,7 +1136,6 @@ class EdgeNetworkChannel(QFrame):
         self.lbl_status.setText(f"Status: {status}")
         if "Connected" in status:
             self.lbl_status.setStyleSheet("color: #00ff00; font-weight: bold; border: none; background: transparent;")
-            self.apply_remote_config()
         else:
             self.lbl_status.setStyleSheet("color: #ffaa00; font-weight: bold; border: none; background: transparent;")
 

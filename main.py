@@ -115,12 +115,14 @@ class VideoThread(QThread):
         self.sim_thresh = 0.50
         self.conf_thresh = 0.30
         self.target_fps = 0
+        self.use_dual_model = True
         
-    def set_params(self, iou, sim, conf, fps):
+    def set_params(self, iou, sim, conf, fps, use_dual_model=True):
         self.iou_thresh = iou
         self.sim_thresh = sim
         self.conf_thresh = conf
         self.target_fps = fps
+        self.use_dual_model = use_dual_model
 
     def run(self):
         # Load models
@@ -219,7 +221,7 @@ class VideoThread(QThread):
                     tracker.reset()
                     best_track = None
                 
-                use_motion = best_track is not None and best_track.missing_frames == 0
+                use_motion = self.use_dual_model and best_track is not None and best_track.missing_frames == 0
                 current_model_name = "Motion Model" if use_motion else "Base Model"
                 if use_motion:
                     pred_bboxes = rgb_prediction_function(best_track)
@@ -261,7 +263,7 @@ class VideoThread(QThread):
                 # ====================================================
 
                 # Eğer hala geçerli bir track varsa Highlight'a geç
-                use_motion = best_track is not None and best_track.missing_frames == 0
+                use_motion = self.use_dual_model and best_track is not None and best_track.missing_frames == 0
                 current_model_name = "Motion Model" if use_motion else "Base Model"
                 
                 if use_motion:
@@ -696,6 +698,12 @@ class VideoChannel(QFrame):
         params_layout.addWidget(self.lbl_fps, 3, 0)
         params_layout.addWidget(self.combo_fps, 3, 1)
         
+        self.chk_dual_model = QCheckBox("Dual Model")
+        self.chk_dual_model.setChecked(True)
+        self.chk_dual_model.setStyleSheet("color: white;")
+        self.chk_dual_model.stateChanged.connect(self.on_params_changed)
+        params_layout.addWidget(self.chk_dual_model, 4, 0, 1, 2)
+        
         left_layout.addLayout(params_layout)
         main_layout.addLayout(left_layout, stretch=3)
         
@@ -738,8 +746,11 @@ class VideoChannel(QFrame):
         self.lbl_sim.setText(f"Sim Thresh: {sim:.2f}")
         self.lbl_conf.setText(f"Conf Thresh: {conf:.2f}")
         
+        use_dual_model = getattr(self, 'chk_dual_model', None)
+        dual = use_dual_model.isChecked() if use_dual_model else True
+        
         if self.thread is not None:
-            self.thread.set_params(iou, sim, conf, fps)
+            self.thread.set_params(iou, sim, conf, fps, dual)
 
     def toggle_video(self):
         if self.thread is None or not self.thread.isRunning():
@@ -1045,6 +1056,10 @@ class EdgeNetworkChannel(QFrame):
         self.chk_no_video = QCheckBox("No Video")
         self.chk_no_video.setStyleSheet("color: white;")
         
+        self.chk_dual_model = QCheckBox("Dual Model")
+        self.chk_dual_model.setChecked(True)
+        self.chk_dual_model.setStyleSheet("color: white;")
+        
         self.btn_apply_config = QPushButton("Apply Config")
         self.btn_apply_config.setStyleSheet(btn_style.replace("#4a362e", "#2e3b4a").replace("#66483c", "#3c4a66"))
         self.btn_apply_config.clicked.connect(self.apply_remote_config)
@@ -1059,6 +1074,7 @@ class EdgeNetworkChannel(QFrame):
         controls_layout.addWidget(QLabel("IOU:"))
         controls_layout.addWidget(self.spin_iou)
         controls_layout.addWidget(self.chk_no_video)
+        controls_layout.addWidget(self.chk_dual_model)
         controls_layout.addWidget(self.btn_apply_config)
         controls_layout.addStretch()
         left_layout.addLayout(controls_layout)
@@ -1083,7 +1099,8 @@ class EdgeNetworkChannel(QFrame):
                 "fps": self.spin_fps.value(),
                 "conf_thresh": self.spin_conf.value(),
                 "iou_thresh": self.spin_iou.value(),
-                "no_video": self.chk_no_video.isChecked()
+                "no_video": self.chk_no_video.isChecked(),
+                "use_dual_model": self.chk_dual_model.isChecked()
             }
             self.thread.send_config(config)
         else:

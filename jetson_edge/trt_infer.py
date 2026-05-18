@@ -125,35 +125,32 @@ class TRTYOLO:
         out = self.outputs[0]['host'].reshape(self.outputs[0]['shape']) # [1, 5, 8400] for 1 class
         out = out[0].T # [8400, 5] (cx, cy, w, h, conf)
         
-        boxes = []
-        scores = []
+        confs = out[:, 4]
+        mask = confs > self.conf_thresh
+        
+        filtered_out = out[mask]
+        scores = confs[mask].tolist()
         
         r = ratio[0]
-        
-        for row in out:
-            conf = row[4]
-            if conf > self.conf_thresh:
-                cx, cy, w, h = row[0], row[1], row[2], row[3]
-                
-                # Undo letterbox padding and scaling
-                cx = (cx - dw) / r
-                cy = (cy - dh) / r
-                w = w / r
-                h = h / r
-                
-                x1 = int(cx - w/2)
-                y1 = int(cy - h/2)
-                width = int(w)
-                height = int(h)
-                
-                boxes.append([x1, y1, width, height])
-                scores.append(float(conf))
-                
-        # NMS
-        indices = nms_numpy(boxes, scores, self.iou_thresh)
-        
         detections = []
-        for i in indices:
-            detections.append(boxes[i])
+        
+        if len(filtered_out) > 0:
+            cx = (filtered_out[:, 0] - dw) / r
+            cy = (filtered_out[:, 1] - dh) / r
+            w = filtered_out[:, 2] / r
+            h = filtered_out[:, 3] / r
+            
+            x1 = (cx - w / 2).astype(int)
+            y1 = (cy - h / 2).astype(int)
+            width = w.astype(int)
+            height = h.astype(int)
+            
+            boxes = np.column_stack((x1, y1, width, height)).tolist()
+            
+            # NMS
+            indices = nms_numpy(boxes, scores, self.iou_thresh)
+            
+            for i in indices:
+                detections.append(boxes[i])
                 
         return detections

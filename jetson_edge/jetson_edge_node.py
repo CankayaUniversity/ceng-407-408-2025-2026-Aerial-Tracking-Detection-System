@@ -129,6 +129,7 @@ def main():
             iou_thresh = float(current_config.get("iou_thresh", 0.45))
             no_video = current_config.get("no_video", False)
             skip_frames = int(current_config.get("skip_frames", args.skip_frames))
+            use_dual_model = current_config.get("use_dual_model", True)
 
             # Engine Paths
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -223,7 +224,7 @@ def main():
                         tracker.reset()
                         best_track = None
                     
-                    use_motion = best_track is not None and best_track.missing_frames == 0
+                    use_motion = use_dual_model and best_track is not None and best_track.missing_frames == 0
                     current_model_name = "Motion Model" if use_motion else "Base Model"
                     
                     if run_detect:
@@ -249,7 +250,7 @@ def main():
                         tracker.reset()
                         best_track = None
                     
-                    use_motion = best_track is not None and best_track.missing_frames == 0
+                    use_motion = use_dual_model and best_track is not None and best_track.missing_frames == 0
                     current_model_name = "Motion Model" if use_motion else "Base Model"
                     
                     if run_detect:

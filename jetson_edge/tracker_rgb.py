@@ -29,39 +29,77 @@ def safe_cosine(a, b):
 
     return cosine(a, b)
 
+def vectorized_iou(boxes1, boxes2):
+    if len(boxes1) == 0 or len(boxes2) == 0:
+        return np.zeros((len(boxes1), len(boxes2)))
+    b1_x1, b1_y1 = boxes1[:, 0], boxes1[:, 1]
+    b1_x2, b1_y2 = boxes1[:, 0] + boxes1[:, 2], boxes1[:, 1] + boxes1[:, 3]
+    b2_x1, b2_y1 = boxes2[:, 0], boxes2[:, 1]
+    b2_x2, b2_y2 = boxes2[:, 0] + boxes2[:, 2], boxes2[:, 1] + boxes2[:, 3]
+    xA = np.maximum(b1_x1[:, np.newaxis], b2_x1[np.newaxis, :])
+    yA = np.maximum(b1_y1[:, np.newaxis], b2_y1[np.newaxis, :])
+    xB = np.minimum(b1_x2[:, np.newaxis], b2_x2[np.newaxis, :])
+    yB = np.minimum(b1_y2[:, np.newaxis], b2_y2[np.newaxis, :])
+    interW = np.maximum(0, xB - xA)
+    interH = np.maximum(0, yB - yA)
+    interArea = interW * interH
+    area1 = (boxes1[:, 2] * boxes1[:, 3])[:, np.newaxis]
+    area2 = (boxes2[:, 2] * boxes2[:, 3])[np.newaxis, :]
+    unionArea = area1 + area2 - interArea
+    return interArea / np.maximum(unionArea, 1e-6)
+
+def vectorized_cosine(embs1, embs2):
+    if len(embs1) == 0 or len(embs2) == 0:
+        return np.ones((len(embs1), len(embs2)))
+    # If all embs in a list are None, return all ones
+    if all(e is None for e in embs1) or all(e is None for e in embs2):
+        return np.ones((len(embs1), len(embs2)))
+    
+    # Get a dummy shape from the first valid embedding
+    valid_shape = next((e.shape for e in embs1 + embs2 if e is not None), (1,))
+    
+    e1 = np.array([e if e is not None else np.zeros(valid_shape) for e in embs1])
+    e2 = np.array([e if e is not None else np.zeros(valid_shape) for e in embs2])
+    
+    # Squeeze out extra dimensions if necessary
+    e1 = np.reshape(e1, (e1.shape[0], -1))
+    e2 = np.reshape(e2, (e2.shape[0], -1))
+    
+    norm1 = np.linalg.norm(e1, axis=1, keepdims=True)
+    norm2 = np.linalg.norm(e2, axis=1, keepdims=True)
+    norm1[norm1 < 1e-6] = 1.0
+    norm2[norm2 < 1e-6] = 1.0
+    
+    return 1.0 - np.dot(e1 / norm1, (e2 / norm2).T)
+
 def prediction_function(track, max_history=5):
     """ Weighted Regression: Son N konuma bakarak t+1 tahmini yapar """
-    if len(track.history) < 2:
+    hist_len = len(track.history)
+    if hist_len < 2:
         return track.bbox
 
-    N = min(max_history, len(track.history))
-    xs, ys, ws, hs = [], [], [], []
+    N = min(max_history, hist_len)
+    hist_arr = np.array(track.history[-N:])
+    xs, ys, ws, hs = hist_arr[:, 0], hist_arr[:, 1], hist_arr[:, 2], hist_arr[:, 3]
 
-    # Yakın geçmişe daha fazla ağırlık veren lineer dağılım
     weights = np.linspace(1, N, N)
-    weights = weights / weights.sum()
-
-    for i in range(-N, 0):
-        x, y, w, h = track.history[i]
-        xs.append(x);
-        ys.append(y);
-        ws.append(w);
-        hs.append(h)
-
+    weights /= weights.sum()
     t = np.arange(N)
 
-    def weighted_linreg(t, values, w_vec):
-        X = np.vstack([t, np.ones_like(t)]).T
-        W = np.diag(w_vec)
-        theta = np.linalg.pinv(X.T @ W @ X) @ (X.T @ W @ values)
-        return theta  # [eğim, kayma]
+    def fast_weighted_linreg(t, values, w):
+        mean_t = np.sum(w * t)
+        mean_y = np.sum(w * values)
+        var_t = np.sum(w * (t - mean_t)**2)
+        if var_t == 0:
+            return 0.0, mean_y
+        cov_ty = np.sum(w * (t - mean_t) * (values - mean_y))
+        a = cov_ty / var_t
+        return a, mean_y - a * mean_t
 
-    a_x, b_x = weighted_linreg(t, np.array(xs), weights)
-    a_y, b_y = weighted_linreg(t, np.array(ys), weights)
+    a_x, b_x = fast_weighted_linreg(t, xs, weights)
+    a_y, b_y = fast_weighted_linreg(t, ys, weights)
 
-    pred_x = a_x * N + b_x
-    pred_y = a_y * N + b_y
-    return [pred_x, pred_y, ws[-1], hs[-1]]
+    return [a_x * N + b_x, a_y * N + b_y, ws[-1], hs[-1]]
 
 
 
@@ -124,21 +162,17 @@ class Tracker:
         if len(self.tracks) < 2:
             return
 
+        bboxes = np.array([t.bbox for t in self.tracks])
+        iou_matrix = vectorized_iou(bboxes, bboxes)
+        
         tracks_to_remove = []
-        for i, track_a in enumerate(self.tracks):
-            for j, track_b in enumerate(self.tracks):
-                if i >= j: continue
-
-
-                track_iou = iou(track_a.bbox, track_b.bbox)
-
-                # Delete very close tracks
-                if track_iou > 0.80:
-
-                    if track_a.track_id > track_b.track_id:
-                        tracks_to_remove.append(track_a)
+        for i in range(len(self.tracks)):
+            for j in range(i + 1, len(self.tracks)):
+                if iou_matrix[i, j] > 0.80:
+                    if self.tracks[i].track_id > self.tracks[j].track_id:
+                        tracks_to_remove.append(self.tracks[i])
                     else:
-                        tracks_to_remove.append(track_b)
+                        tracks_to_remove.append(self.tracks[j])
 
         # Listeden temizle
         self.tracks = [t for t in self.tracks if t not in tracks_to_remove]
@@ -179,41 +213,29 @@ class Tracker:
         alpha = 0.5
         iou_threshold = 0.00
 
-        cost_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
-
         # -------------------------------
-        # COST MATRIX (PREDICTION-BASED)
+        # VECTORIZED COST MATRIX
         # -------------------------------
-        for t_idx, track in enumerate(self.tracks):
-
-            # 🔥 prediction sadece 1 kere
-            pred_bbox = prediction_function(track)
-
-            for d_idx, det_bbox in enumerate(detections):
-                # Alan büyümesi kontrolü (Area Growth Check)
-                pred_area = pred_bbox[2] * pred_bbox[3]
-                det_area = det_bbox[2] * det_bbox[3]
-                if pred_area > 0 and det_area > 3.0 * pred_area:
-                    cost_matrix[t_idx, d_idx] = 1e6
-                    continue
-
-                iou_score = iou(pred_bbox, det_bbox)
-                iou_cost = 1.0 - iou_score
-
-                if iou_score < iou_threshold:
-                    cost_matrix[t_idx, d_idx] = 1e6
-                    continue
-
-                # 🔑 Appearance var mı
-                if track.embedding is None or embeddings[d_idx] is None:
-                    # SADECE IoU
-                    cost = iou_cost
-
-                else:
-                    appearance_cost = safe_cosine(track.embedding, embeddings[d_idx])
-                    cost = alpha * appearance_cost + (1 - alpha) * iou_cost
-
-                cost_matrix[t_idx, d_idx] = cost
+        pred_bboxes = np.array([prediction_function(t) for t in self.tracks])
+        det_bboxes = np.array(detections)
+        
+        iou_matrix = vectorized_iou(pred_bboxes, det_bboxes)
+        iou_cost_matrix = 1.0 - iou_matrix
+        
+        pred_areas = (pred_bboxes[:, 2] * pred_bboxes[:, 3])[:, np.newaxis]
+        det_areas = (det_bboxes[:, 2] * det_bboxes[:, 3])[np.newaxis, :]
+        area_growth_mask = (pred_areas > 0) & (det_areas > 3.0 * pred_areas)
+        
+        track_embs = [t.embedding for t in self.tracks]
+        cosine_dist_matrix = vectorized_cosine(track_embs, embeddings)
+        
+        cost_matrix = alpha * cosine_dist_matrix + (1 - alpha) * iou_cost_matrix
+        
+        emb_missing_mask = np.array([e is None for e in track_embs])[:, np.newaxis] | np.array([e is None for e in embeddings])[np.newaxis, :]
+        cost_matrix = np.where(emb_missing_mask, iou_cost_matrix, cost_matrix)
+        
+        invalid_mask = area_growth_mask | (iou_matrix < iou_threshold)
+        cost_matrix[invalid_mask] = 1e6
 
         cost_matrix = np.nan_to_num(
             cost_matrix,

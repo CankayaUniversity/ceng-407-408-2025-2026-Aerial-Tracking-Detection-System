@@ -14,6 +14,16 @@ from tracker_ir import Tracker as IRTracker, prediction_function as ir_predictio
 from utils import apply_highlight_test as apply_highlight_rgb, apply_highlight_ir
 from trt_infer import TRTYOLO
 
+try:
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        USE_CUDA_FLOW = True
+        cuda_flow = cv2.cuda.SparsePyrLKOpticalFlow_create()
+        print("[+] OpenCV CUDA is available! Using GPU for Optical Flow.")
+    else:
+        USE_CUDA_FLOW = False
+except Exception:
+    USE_CUDA_FLOW = False
+
 def discover_server(udp_port=50050, timeout=30):
     print(f"[*] Listening for Main Hub broadcast on UDP port {udp_port}...")
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -85,7 +95,24 @@ def capture_thread(cap, frame_queue, config_event, is_live, target_fps, orig_w, 
             if prev_pts is None or len(prev_pts) < 10:
                 prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
             if prev_pts is not None and len(prev_pts) > 0:
-                curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_small, prev_pts, None)
+                global USE_CUDA_FLOW
+                if USE_CUDA_FLOW:
+                    try:
+                        d_prev = cv2.cuda_GpuMat()
+                        d_curr = cv2.cuda_GpuMat()
+                        d_pts = cv2.cuda_GpuMat()
+                        d_prev.upload(prev_gray)
+                        d_curr.upload(gray_small)
+                        d_pts.upload(prev_pts)
+                        global cuda_flow
+                        d_curr_pts, d_status, d_err = cuda_flow.calc(d_prev, d_curr, d_pts, None)
+                        curr_pts = d_curr_pts.download()
+                        status = d_status.download()
+                    except Exception:
+                        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_small, prev_pts, None)
+                else:
+                    curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray_small, prev_pts, None)
+                    
                 if curr_pts is not None and status is not None:
                     status = status.flatten()
                     good_new = curr_pts[status == 1]

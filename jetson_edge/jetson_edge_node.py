@@ -152,13 +152,21 @@ def main():
     parser = argparse.ArgumentParser(description="Jetson Edge Node (Pure TensorRT) for Aerial Tracking")
     parser.add_argument("--video", type=str, default="0", help="Path to video file or camera index (default: 0)")
     parser.add_argument("--skip-frames", type=int, default=0, help="Skip N frames between detections to save computation (default: 0)")
+    parser.add_argument("--server-ip", type=str, default=None, help="Manually specify Main PC IP address to bypass UDP broadcast discovery")
+    parser.add_argument("--server-port", type=int, default=8485, help="Main PC TCP port (default: 8485)")
     args = parser.parse_args()
 
-    # Auto-discover main server
-    server_ip, server_port = discover_server()
-    if not server_ip:
-        print("Could not find Main Hub. Exiting.")
-        sys.exit(1)
+    # Get server IP and port
+    if args.server_ip:
+        server_ip = args.server_ip
+        server_port = args.server_port
+        print(f"[+] Using manual Main Hub address: {server_ip}:{server_port}")
+    else:
+        # Auto-discover main server
+        server_ip, server_port = discover_server()
+        if not server_ip:
+            print("Could not find Main Hub via auto-discovery. Exiting.")
+            sys.exit(1)
 
     # Connect TCP
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

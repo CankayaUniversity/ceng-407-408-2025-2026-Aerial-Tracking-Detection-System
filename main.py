@@ -550,7 +550,7 @@ class LogPanel(QFrame):
 
 class VideoLabel(QLabel):
     def sizeHint(self):
-        return QSize(480, 360)
+        return QSize(480, 270)
 
 class VideoChannel(QFrame):
     closed_signal = pyqtSignal(object)
@@ -605,7 +605,8 @@ class VideoChannel(QFrame):
         # Video Display
         self.video_label = VideoLabel("No Video Loaded")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setMinimumSize(1, 1)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_label.setMinimumSize(480, 270)
         self.video_label.setStyleSheet("""
             background-color: #000000;
             border-radius: 10px;
@@ -615,7 +616,6 @@ class VideoChannel(QFrame):
             font-family: 'Segoe UI', Arial, sans-serif;
             border: 2px solid #333333;
         """)
-        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         left_layout.addWidget(self.video_label)
         
         # Controls
@@ -705,7 +705,7 @@ class VideoChannel(QFrame):
         params_layout.addWidget(self.chk_dual_model, 4, 0, 1, 2)
         
         left_layout.addLayout(params_layout)
-        main_layout.addLayout(left_layout, stretch=3)
+        main_layout.addLayout(left_layout, stretch=9)
         
         # Right side: Telemetry + Log
         right_layout = QVBoxLayout()
@@ -715,7 +715,7 @@ class VideoChannel(QFrame):
         self.log_panel = LogPanel()
         right_layout.addWidget(self.log_panel, stretch=1)
         
-        main_layout.addLayout(right_layout, stretch=1)
+        main_layout.addLayout(right_layout, stretch=2)
 
     def request_close(self):
         self.close_channel()
@@ -995,7 +995,8 @@ class EdgeNetworkChannel(QFrame):
         # Video Display
         self.video_label = VideoLabel("Waiting for Edge Video Feed...")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setMinimumSize(1, 1)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_label.setMinimumSize(480, 270)
         self.video_label.setStyleSheet("""
             background-color: #000000;
             border-radius: 10px;
@@ -1005,11 +1006,10 @@ class EdgeNetworkChannel(QFrame):
             font-family: 'Segoe UI', Arial, sans-serif;
             border: 2px solid #333333;
         """)
-        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         left_layout.addWidget(self.video_label)
         
         # Controls
-        controls_layout = QHBoxLayout()
+        controls_layout = QVBoxLayout()
         btn_style = """
             QPushButton {
                 background-color: #4a362e;
@@ -1069,24 +1069,33 @@ class EdgeNetworkChannel(QFrame):
         self.btn_apply_config.setStyleSheet(btn_style.replace("#4a362e", "#2e3b4a").replace("#66483c", "#3c4a66"))
         self.btn_apply_config.clicked.connect(self.apply_remote_config)
         
-        controls_layout.addWidget(self.btn_listen)
-        controls_layout.addWidget(QLabel("Mode:"))
-        controls_layout.addWidget(self.combo_mode)
-        controls_layout.addWidget(QLabel("FPS:"))
-        controls_layout.addWidget(self.spin_fps)
-        controls_layout.addWidget(QLabel("Conf:"))
-        controls_layout.addWidget(self.spin_conf)
-        controls_layout.addWidget(QLabel("IOU:"))
-        controls_layout.addWidget(self.spin_iou)
-        controls_layout.addWidget(QLabel("Skip:"))
-        controls_layout.addWidget(self.spin_skip_frames)
-        controls_layout.addWidget(self.chk_no_video)
-        controls_layout.addWidget(self.chk_dual_model)
-        controls_layout.addWidget(self.btn_apply_config)
-        controls_layout.addStretch()
+        row1_layout = QHBoxLayout()
+        row1_layout.setSpacing(10)
+        row1_layout.addWidget(self.btn_listen)
+        row1_layout.addWidget(self.chk_no_video)
+        row1_layout.addWidget(self.chk_dual_model)
+        row1_layout.addWidget(self.btn_apply_config)
+        row1_layout.addStretch()
+        
+        row2_layout = QHBoxLayout()
+        row2_layout.setSpacing(10)
+        row2_layout.addWidget(QLabel("Mode:"))
+        row2_layout.addWidget(self.combo_mode)
+        row2_layout.addWidget(QLabel("FPS:"))
+        row2_layout.addWidget(self.spin_fps)
+        row2_layout.addWidget(QLabel("Conf:"))
+        row2_layout.addWidget(self.spin_conf)
+        row2_layout.addWidget(QLabel("IOU:"))
+        row2_layout.addWidget(self.spin_iou)
+        row2_layout.addWidget(QLabel("Skip:"))
+        row2_layout.addWidget(self.spin_skip_frames)
+        row2_layout.addStretch()
+        
+        controls_layout.addLayout(row1_layout)
+        controls_layout.addLayout(row2_layout)
         left_layout.addLayout(controls_layout)
         
-        main_layout.addLayout(left_layout, stretch=3)
+        main_layout.addLayout(left_layout, stretch=9)
         
         # Right side: Telemetry + Log
         right_layout = QVBoxLayout()
@@ -1096,7 +1105,7 @@ class EdgeNetworkChannel(QFrame):
         self.log_panel = LogPanel()
         right_layout.addWidget(self.log_panel, stretch=1)
         
-        main_layout.addLayout(right_layout, stretch=1)
+        main_layout.addLayout(right_layout, stretch=2)
 
     def apply_remote_config(self):
         if self.thread and getattr(self.thread, 'conn', None):
@@ -1322,10 +1331,10 @@ class App(QMainWindow):
         new_channel = VideoChannel(self.channel_counter)
         new_channel.closed_signal.connect(self.remove_channel)
         
-        # Calculate grid position: (0,0), (0,1), (1,0), (1,1)
+        # Calculate grid position: stack vertically in a single column
         idx = len(self.channels)
-        row = idx // 2
-        col = idx % 2
+        row = idx
+        col = 0
         
         self.channels_layout.addWidget(new_channel, row, col)
         self.channels.append(new_channel)
@@ -1343,8 +1352,8 @@ class App(QMainWindow):
         new_channel.closed_signal.connect(self.remove_channel)
         
         idx = len(self.channels)
-        row = idx // 2
-        col = idx % 2
+        row = idx
+        col = 0
         
         self.channels_layout.addWidget(new_channel, row, col)
         self.channels.append(new_channel)
@@ -1367,8 +1376,8 @@ class App(QMainWindow):
     def rearrange_channels(self):
         for idx, ch in enumerate(self.channels):
             self.channels_layout.removeWidget(ch)
-            row = idx // 2
-            col = idx % 2
+            row = idx
+            col = 0
             self.channels_layout.addWidget(ch, row, col)
         
     def closeEvent(self, event):

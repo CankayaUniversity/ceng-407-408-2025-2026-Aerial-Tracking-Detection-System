@@ -117,15 +117,22 @@ The Edge Node has two types of parameters: Local CLI arguments and Remote Config
 
 #### Example Run Commands:
 
-**Standard Camera Run (Uses `/dev/video0`):**
+**Standard Camera Run (Uses `/dev/video0` with Auto-Discovery):**
 ```bash
 cd /home/jetson/jetson_edge
 python3 jetson_edge_node.py --video 0
 ```
 
-**Video File Run with Frame Skipping (High FPS):**
+**Bypassing Auto-Discovery (Direct IP Connection - Highly Recommended for Wi-Fi to Ethernet setups):**
+If your Wi-Fi router blocks UDP broadcasts or puts Wi-Fi and Ethernet on different subnets, bypass auto-discovery by specifying your Main PC's local IP address directly:
 ```bash
-python3 jetson_edge_node.py --video 5.mp4 --skip-frames 1
+python3 jetson_edge_node.py --video 0 --server-ip <YOUR_PC_IP_ADDRESS>
+```
+*(Replace `<YOUR_PC_IP_ADDRESS>` with the IP of your Main PC, e.g. `192.168.1.5`)*
+
+**Video File Run with Frame Skipping and Direct IP:**
+```bash
+python3 jetson_edge_node.py --video 5.mp4 --skip-frames 1 --server-ip <YOUR_PC_IP_ADDRESS>
 ```
 
-As soon as the script starts, it will output `[*] Listening for Main Hub broadcast on UDP port 50050...` and connect automatically within a few seconds (`[+] Connected to Main Hub.`).
+When run with direct IP, it will instantly establish a TCP handshake without relying on network broadcast (`[+] Connected to Main Hub.`). Otherwise, it will fallback to listening for Main Hub broadcast on UDP port 50050.

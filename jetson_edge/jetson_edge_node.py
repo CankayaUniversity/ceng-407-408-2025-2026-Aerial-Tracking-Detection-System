@@ -237,6 +237,8 @@ def main():
             no_video = current_config.get("no_video", False)
             skip_frames = int(current_config.get("skip_frames", args.skip_frames))
             use_dual_model = current_config.get("use_dual_model", True)
+            pred_method = current_config.get("pred_method", "linear")
+            use_motion_reid = current_config.get("use_motion_reid", False)
 
             # Engine Paths
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -299,7 +301,7 @@ def main():
                     
                     if run_detect:
                         if use_motion:
-                            pred_bboxes = rgb_prediction_function(best_track)
+                            pred_bboxes = rgb_prediction_function(best_track, method=pred_method)
                             input_frame = apply_highlight_rgb(frame, pred_bboxes)
                             model = motion_model
                         else:
@@ -311,7 +313,12 @@ def main():
                         
                     t_detect = time.time() - t0
                     t0 = time.time()
-                    embeddings = [None] * len(detections)
+                    if use_motion and not use_motion_reid:
+                        embeddings = [None] * len(detections)
+                    else:
+                        # On edge, since we don't have ResNet here, if it's motion and we want re-id, we would need the embeddings. 
+                        # But Jetson edge node just uses None for now, as it only runs TRT YOLO. 
+                        embeddings = [None] * len(detections)
                     tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
                 else:
                     tracker.iou_threshold = 0.1
@@ -325,7 +332,7 @@ def main():
                     
                     if run_detect:
                         if use_motion:
-                            pred_bboxes = ir_prediction_function(best_track)
+                            pred_bboxes = ir_prediction_function(best_track, method=pred_method)
                             input_frame = apply_highlight_ir(frame, pred_bboxes)
                             model = motion_model
                         else:
@@ -352,11 +359,49 @@ def main():
                     active_tracks_count += 1
                     x, y, w, h = map(int, t.bbox)
                     sim_val = getattr(t, 'sim', 0.0)
-                    all_tracks_info.append({
+                    
+                    track_data = {
                         "id": t.track_id, 
                         "bbox": [x, y, w, h], 
                         "sim": float(sim_val)
-                    })
+                    }
+                    
+                    if len(t.history) >= 2:
+                        prev_b = t.history[-2]
+                        curr_b = t.history[-1]
+                        
+                        raw_vx = (curr_b[0] + curr_b[2]/2) - (prev_b[0] + prev_b[2]/2)
+                        raw_vy = (curr_b[1] + curr_b[3]/2) - (prev_b[1] + prev_b[3]/2)
+                        
+                        true_vx = raw_vx - bg_dx
+                        true_vy = raw_vy - bg_dy
+                        
+                        alpha = 0.2
+                        if not hasattr(t, 'smooth_vx'):
+                            t.smooth_vx = true_vx
+                            t.smooth_vy = true_vy
+                        else:
+                            t.smooth_vx = alpha * true_vx + (1 - alpha) * t.smooth_vx
+                            t.smooth_vy = alpha * true_vy + (1 - alpha) * t.smooth_vy
+                            
+                        track_data["vx"] = t.smooth_vx
+                        track_data["vy"] = t.smooth_vy
+                        
+                        # Calculate prediction trajectory
+                        if mode.upper() == "RGB":
+                            pred_b = rgb_prediction_function(t, method=pred_method)
+                        else:
+                            pred_b = ir_prediction_function(t, method=pred_method)
+                            
+                        pred_cx = pred_b[0] + pred_b[2] / 2
+                        pred_cy = pred_b[1] + pred_b[3] / 2
+                        curr_cx = curr_b[0] + curr_b[2] / 2
+                        curr_cy = curr_b[1] + curr_b[3] / 2
+                        
+                        track_data["px"] = pred_cx - curr_cx
+                        track_data["py"] = pred_cy - curr_cy
+                        
+                    all_tracks_info.append(track_data)
                     
                     score = min(len(t.history), int(2 * target_fps)) / (2 * target_fps) * 0.5 + sim_val * 0.5
                     if score > best_active_score:

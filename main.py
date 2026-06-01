@@ -97,6 +97,37 @@ def draw_hud_bbox(frame, x, y, w, h, track_id, sim=0.0, corner_len_ratio=0.25, c
     cv2.rectangle(frame, (x, tag_y - th - 4), (x + tw + 8, tag_y + 4), (0, 0, 0), -1)
     cv2.putText(frame, label, (x + 4, tag_y), font, scale, color, thick, cv2.LINE_AA)
 
+def draw_trajectory_prediction(frame, cx, cy, vx, vy, steps=5, step_interval=5, color=(0, 255, 150)):
+    """Draws a premium particle-fading trajectory projection line indicating future positions."""
+    prev_pt = (int(cx), int(cy))
+    for i in range(1, steps + 1):
+        future_frame = i * step_interval
+        pred_cx = cx + vx * future_frame
+        pred_cy = cy + vy * future_frame
+        curr_pt = (int(pred_cx), int(pred_cy))
+        
+        # Check if coordinates are within reasonable frame boundaries
+        if not (0 <= curr_pt[0] < frame.shape[1] and 0 <= curr_pt[1] < frame.shape[0]):
+            break
+            
+        # Particle size fading
+        dot_radius = max(2, int(5 - i))
+        
+        # Color fading (gradually darkens to create depth/fading effect)
+        fade_factor = 1.0 - (i * 0.15)
+        faded_color = (
+            int(color[0] * fade_factor),
+            int(color[1] * fade_factor),
+            int(color[2] * fade_factor)
+        )
+        
+        # Draw particle circle
+        cv2.circle(frame, curr_pt, dot_radius, faded_color, -1)
+        
+        # Draw thin connecting line
+        cv2.line(frame, prev_pt, curr_pt, faded_color, 1, cv2.LINE_AA)
+        prev_pt = curr_pt
+
 
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -116,13 +147,17 @@ class VideoThread(QThread):
         self.conf_thresh = 0.30
         self.target_fps = 0
         self.use_dual_model = True
+        self.pred_method = "linear"
+        self.use_motion_reid = False
         
-    def set_params(self, iou, sim, conf, fps, use_dual_model=True):
+    def set_params(self, iou, sim, conf, fps, use_dual_model=True, pred_method="linear", use_motion_reid=False):
         self.iou_thresh = iou
         self.sim_thresh = sim
         self.conf_thresh = conf
         self.target_fps = fps
         self.use_dual_model = use_dual_model
+        self.pred_method = pred_method
+        self.use_motion_reid = use_motion_reid
 
     def run(self):
         # Load models
@@ -204,6 +239,7 @@ class VideoThread(QThread):
                         else:
                             prev_pts = None
             prev_gray = gray
+            current_highlight_boxes = []
             
             if self.mode == "RGB":
                 tracker.similarity_threshold = self.sim_thresh
@@ -224,7 +260,8 @@ class VideoThread(QThread):
                 use_motion = self.use_dual_model and best_track is not None and best_track.missing_frames == 0
                 current_model_name = "Motion Model" if use_motion else "Base Model"
                 if use_motion:
-                    pred_bboxes = rgb_prediction_function(best_track)
+                    pred_bboxes = rgb_prediction_function(best_track, method=self.pred_method)
+                    current_highlight_boxes = pred_bboxes
                     input_frame = apply_highlight_rgb(frame, pred_bboxes)
                     model = motion_model
                 else:
@@ -247,8 +284,13 @@ class VideoThread(QThread):
                                 device
                             )
                         else:
-                            roi = get_roi(feat_map, bbox, orig_w, orig_h)
-                            emb = roi_align_no_embedding(roi)
+                            if use_motion and not self.use_motion_reid:
+                                # Feature map is from darkened image, so embedding will be completely different from Base Model.
+                                # Use None to force IoU-only tracking during Motion Model (like IR does) unless user opts in.
+                                emb = None
+                            else:
+                                roi = get_roi(feat_map, bbox, orig_w, orig_h)
+                                emb = roi_align_no_embedding(roi)
                         embeddings.append(emb)
                 tracker.update(detections, embeddings, frame_idx, orig_w, orig_h, bg_dx, bg_dy)
             else:
@@ -267,7 +309,8 @@ class VideoThread(QThread):
                 current_model_name = "Motion Model" if use_motion else "Base Model"
                 
                 if use_motion:
-                    pred_bboxes = ir_prediction_function(best_track)
+                    pred_bboxes = ir_prediction_function(best_track, method=self.pred_method)
+                    current_highlight_boxes = pred_bboxes
                     input_frame = apply_highlight_ir(frame, pred_bboxes)
                     model = motion_model
                 else:
@@ -300,11 +343,75 @@ class VideoThread(QThread):
                 sim_val = getattr(t, 'sim', 0.0)
                 draw_hud_bbox(frame, x, y, w, h, t.track_id, sim=sim_val)
                 
+                # Draw trajectory prediction vector with Optical Flow cancellation and EMA Smoothing
+                if len(t.history) >= 2:
+                    if not hasattr(t, 'smooth_vx'):
+                        t.smooth_vx = 0.0
+                        t.smooth_vy = 0.0
+                        
+                    curr_box = t.history[-1]
+                    prev_box = t.history[-2]
+                    cx = curr_box[0] + curr_box[2] / 2
+                    cy = curr_box[1] + curr_box[3] / 2
+                    pcx = prev_box[0] + prev_box[2] / 2
+                    pcy = prev_box[1] + prev_box[3] / 2
+                    
+                    # Instantaneous pixel velocity
+                    inst_vx = cx - pcx
+                    inst_vy = cy - pcy
+                    
+                    # Subtract instantaneous camera background motion (Optical Flow)
+                    inst_true_vx = inst_vx - bg_dx
+                    inst_true_vy = inst_vy - bg_dy
+                    
+                    # Exponential Moving Average for smooth trajectory lines
+                    alpha = 0.2 # Smoothing factor
+                    t.smooth_vx = (1.0 - alpha) * t.smooth_vx + alpha * inst_true_vx
+                    t.smooth_vy = (1.0 - alpha) * t.smooth_vy + alpha * inst_true_vy
+                    
+                    # Calculate Prediction target for visualization
+                    if self.mode.upper() == "RGB":
+                        pred_b = rgb_prediction_function(t, method=self.pred_method)
+                    else:
+                        pred_b = ir_prediction_function(t, method=self.pred_method)
+                    
+                    pred_cx = pred_b[0] + pred_b[2] / 2
+                    pred_cy = pred_b[1] + pred_b[3] / 2
+                    pred_vx = pred_cx - cx
+                    pred_vy = pred_cy - cy
+                    
+                    # Only draw if the target is moving relative to the background
+                    speed = np.hypot(t.smooth_vx, t.smooth_vy)
+                    if speed > 0.5:
+                        draw_trajectory_prediction(frame, cx, cy, t.smooth_vx, t.smooth_vy, color=(0, 255, 150)) # Green: Physical Speed
+                        
+                    pred_speed = np.hypot(pred_vx, pred_vy)
+                    if pred_speed > 0.5:
+                        draw_trajectory_prediction(frame, cx, cy, pred_vx, pred_vy, color=(255, 150, 0)) # Blue: Predicted Path
+                
                 score = min(len(t.history), int(2 * fps)) / (2 * fps) * 0.5 + sim_val * 0.5
                 if score > best_active_score:
                     best_active_score = score
                     best_active = t
-            
+
+            # Draw Highlight Boxes for debugging
+            if current_highlight_boxes is not None and len(current_highlight_boxes) > 0:
+                # Handle single bbox vs list of bboxes
+                boxes_to_draw = current_highlight_boxes
+                if not isinstance(boxes_to_draw[0], (list, tuple, np.ndarray)):
+                    boxes_to_draw = [boxes_to_draw]
+                    
+                for hb in boxes_to_draw:
+                    hx, hy, hw, hh = map(int, hb)
+                    expand_ratio = 3.0
+                    nx1 = int(max(0, hx - (hw * (expand_ratio - 1) / 2)))
+                    ny1 = int(max(0, hy - (hh * (expand_ratio - 1) / 2)))
+                    nx2 = int(min(orig_w, hx + hw + (hw * (expand_ratio - 1) / 2)))
+                    ny2 = int(min(orig_h, hy + hh + (hh * (expand_ratio - 1) / 2)))
+                    
+                    cv2.rectangle(frame, (nx1, ny1), (nx2, ny2), (255, 0, 255), 2, cv2.LINE_AA)
+                    cv2.putText(frame, "HIGHLIGHT ZONE", (nx1, ny1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+
             # Log new tracks
             new_ids = curr_track_ids - prev_track_ids
             for nid in new_ids:
@@ -702,7 +809,20 @@ class VideoChannel(QFrame):
         self.chk_dual_model.setChecked(True)
         self.chk_dual_model.setStyleSheet("color: white;")
         self.chk_dual_model.stateChanged.connect(self.on_params_changed)
-        params_layout.addWidget(self.chk_dual_model, 4, 0, 1, 2)
+        params_layout.addWidget(self.chk_dual_model, 4, 0)
+        
+        self.chk_motion_reid = QCheckBox("Motion Re-ID")
+        self.chk_motion_reid.setChecked(False)
+        self.chk_motion_reid.setStyleSheet("color: white;")
+        self.chk_motion_reid.stateChanged.connect(self.on_params_changed)
+        params_layout.addWidget(self.chk_motion_reid, 4, 1)
+        
+        self.lbl_pred = QLabel("Prediction:")
+        self.combo_pred = QComboBox()
+        self.combo_pred.addItems(["Linear", "Kalman", "Static"])
+        self.combo_pred.currentTextChanged.connect(self.on_params_changed)
+        params_layout.addWidget(self.lbl_pred, 5, 0)
+        params_layout.addWidget(self.combo_pred, 5, 1)
         
         left_layout.addLayout(params_layout)
         main_layout.addLayout(left_layout, stretch=9)
@@ -749,8 +869,13 @@ class VideoChannel(QFrame):
         use_dual_model = getattr(self, 'chk_dual_model', None)
         dual = use_dual_model.isChecked() if use_dual_model else True
         
+        use_motion_reid = getattr(self, 'chk_motion_reid', None)
+        motion_reid = use_motion_reid.isChecked() if use_motion_reid else False
+        
+        pred_method = self.combo_pred.currentText().lower()
+        
         if self.thread is not None:
-            self.thread.set_params(iou, sim, conf, fps, dual)
+            self.thread.set_params(iou, sim, conf, fps, dual, pred_method, motion_reid)
 
     def toggle_video(self):
         if self.thread is None or not self.thread.isRunning():
@@ -905,6 +1030,17 @@ class EdgeNetworkThread(QThread):
                             for t in tracks:
                                 x, y, w, h = t["bbox"]
                                 draw_hud_bbox(frame, x, y, w, h, t["id"], sim=t.get("sim", 0.0))
+                                
+                                if "vx" in t and "vy" in t:
+                                    cx = x + w / 2
+                                    cy = y + h / 2
+                                    speed = np.hypot(t["vx"], t["vy"])
+                                    if speed > 0.5:
+                                        draw_trajectory_prediction(frame, cx, cy, t["vx"], t["vy"], color=(0, 255, 150))
+                                    if "px" in t and "py" in t:
+                                        pred_speed = np.hypot(t["px"], t["py"])
+                                        if pred_speed > 0.5:
+                                            draw_trajectory_prediction(frame, cx, cy, t["px"], t["py"], color=(255, 150, 0))
                         except Exception:
                             pass
                         self.change_pixmap_signal.emit(frame)
@@ -1089,6 +1225,11 @@ class EdgeNetworkChannel(QFrame):
         row2_layout.addWidget(self.spin_iou)
         row2_layout.addWidget(QLabel("Skip:"))
         row2_layout.addWidget(self.spin_skip_frames)
+        row2_layout.addWidget(QLabel("Pred:"))
+        self.combo_pred = QComboBox()
+        self.combo_pred.addItems(["Linear", "Kalman", "Static"])
+        self.combo_pred.setStyleSheet("background-color: #333333; color: white;")
+        row2_layout.addWidget(self.combo_pred)
         row2_layout.addStretch()
         
         controls_layout.addLayout(row1_layout)
@@ -1117,7 +1258,8 @@ class EdgeNetworkChannel(QFrame):
                 "iou_thresh": self.spin_iou.value(),
                 "no_video": self.chk_no_video.isChecked(),
                 "use_dual_model": self.chk_dual_model.isChecked(),
-                "skip_frames": self.spin_skip_frames.value()
+                "skip_frames": self.spin_skip_frames.value(),
+                "pred_method": self.combo_pred.currentText().lower()
             }
             self.thread.send_config(config)
         else:

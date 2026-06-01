@@ -35,12 +35,19 @@ def vectorized_iou(boxes1, boxes2):
     unionArea = area1 + area2 - interArea
     return interArea / np.maximum(unionArea, 1e-6)
 
-def prediction_function(track, max_history=5):
-    """ Weighted Regression: Son N konuma bakarak t+1 tahmini yapar """
-    hist_len = len(track.history)
-    if hist_len < 2:
+def prediction_function(track, max_history=5, method="linear"):
+    if method == "static" or len(track.history) < 2:
         return track.bbox
+        
+    if method == "kalman" and hasattr(track, 'kf') and track.kf is not None:
+        cx, cy, w, h = track.kf.x[0, 0], track.kf.x[1, 0], track.kf.x[2, 0], track.kf.x[3, 0]
+        vx, vy = track.kf.x[4, 0], track.kf.x[5, 0]
+        return [cx + vx - w/2, cy + vy - h/2, w, h]
+        
+    if len(track.history) == 0: return track.bbox
+    if len(track.history) == 1: return track.history[-1]
 
+    hist_len = len(track.history)
     N = min(max_history, hist_len)
     hist_arr = np.array(track.history[-N:])
     xs, ys, ws, hs = hist_arr[:, 0], hist_arr[:, 1], hist_arr[:, 2], hist_arr[:, 3]

@@ -16,10 +16,17 @@ def iou(boxA, boxB):
     return interArea / union if union > 0 else 0.0
 
 
-def prediction_function(track, max_history=5):
-    """ Weighted Regression: Son N konuma bakarak t+1 tahmini yapar """
-    if len(track.history) < 2:
+def prediction_function(track, max_history=5, method="linear"):
+    if method == "static" or len(track.history) < 2:
         return track.bbox
+        
+    if method == "kalman" and hasattr(track, 'kf') and track.kf is not None:
+        cx, cy, w, h = track.kf.x[0, 0], track.kf.x[1, 0], track.kf.x[2, 0], track.kf.x[3, 0]
+        vx, vy = track.kf.x[4, 0], track.kf.x[5, 0]
+        return [cx + vx - w/2, cy + vy - h/2, w, h]
+        
+    if len(track.history) == 0: return track.bbox
+    if len(track.history) == 1: return track.history[-1]
 
     N = min(max_history, len(track.history))
     xs, ys, ws, hs = [], [], [], []

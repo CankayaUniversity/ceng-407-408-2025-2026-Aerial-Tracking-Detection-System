@@ -72,13 +72,19 @@ def vectorized_cosine(embs1, embs2):
     
     return 1.0 - np.dot(e1 / norm1, (e2 / norm2).T)
 
-def prediction_function(track, max_history=5):
-    """ Weighted Regression: Son N konuma bakarak t+1 tahmini yapar """
-    hist_len = len(track.history)
-    if hist_len < 2:
+def prediction_function(track, max_history=5, method="linear"):
+    if method == "static" or len(track.history) < 2:
         return track.bbox
+        
+    if method == "kalman" and hasattr(track, 'kf') and track.kf is not None:
+        cx, cy, w, h = track.kf.x[0, 0], track.kf.x[1, 0], track.kf.x[2, 0], track.kf.x[3, 0]
+        vx, vy = track.kf.x[4, 0], track.kf.x[5, 0]
+        return [cx + vx - w/2, cy + vy - h/2, w, h]
+        
+    if len(track.history) == 0: return track.bbox
+    if len(track.history) == 1: return track.history[-1]
 
-    N = min(max_history, hist_len)
+    N = min(max_history, len(track.history))
     hist_arr = np.array(track.history[-N:])
     xs, ys, ws, hs = hist_arr[:, 0], hist_arr[:, 1], hist_arr[:, 2], hist_arr[:, 3]
 
@@ -106,6 +112,8 @@ def prediction_function(track, max_history=5):
 def update_embedding(old_emb, new_emb, momentum=0.9):
     if old_emb is None:
         return new_emb
+    if new_emb is None:
+        return old_emb
 
     emb = momentum * old_emb + (1 - momentum) * new_emb
     emb /= np.linalg.norm(emb) + 1e-6
